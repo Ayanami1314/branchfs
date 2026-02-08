@@ -53,10 +53,15 @@ class BranchFSBench:
         env = os.environ.copy()
         env["RUST_LOG"] = "debug"
 
+        cmd = [self.branchfs, "mount", "--base", str(base_dir),
+               "--storage", str(storage)]
+        if os.geteuid() == 0:
+            cmd.append("--passthrough")
+        cmd.append(str(mountpoint))
+
         with open(log_file, "w") as f:
             proc = subprocess.Popen(
-                [self.branchfs, "mount", "--base", str(base_dir),
-                 "--storage", str(storage), str(mountpoint)],
+                cmd,
                 env=env,
                 stdout=f,
                 stderr=subprocess.STDOUT

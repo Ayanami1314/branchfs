@@ -27,6 +27,10 @@ enum Commands {
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
 
+        /// Enable FUSE passthrough for near-native I/O performance (requires root)
+        #[arg(long)]
+        passthrough: bool,
+
         /// Mount point
         mountpoint: PathBuf,
     },
@@ -144,8 +148,14 @@ fn main() -> Result<()> {
         Commands::Mount {
             base,
             storage,
+            passthrough,
             mountpoint,
         } => {
+            if passthrough && nix::unistd::geteuid().as_raw() != 0 {
+                eprintln!("Error: --passthrough requires root (CAP_SYS_ADMIN)");
+                process::exit(1);
+            }
+
             std::fs::create_dir_all(&storage)?;
             let storage = storage.canonicalize()?;
 
@@ -166,6 +176,7 @@ fn main() -> Result<()> {
                 &Request::Mount {
                     branch: "main".to_string(),
                     mountpoint: mountpoint.to_string_lossy().to_string(),
+                    passthrough,
                 },
             )?;
 

@@ -19,11 +19,26 @@ use crate::fs::BranchFs;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    Mount { branch: String, mountpoint: String },
-    Unmount { mountpoint: String },
-    Create { name: String, parent: String },
-    NotifySwitch { mountpoint: String, branch: String },
-    GetMountBranch { mountpoint: String },
+    Mount {
+        branch: String,
+        mountpoint: String,
+        #[serde(default)]
+        passthrough: bool,
+    },
+    Unmount {
+        mountpoint: String,
+    },
+    Create {
+        name: String,
+        parent: String,
+    },
+    NotifySwitch {
+        mountpoint: String,
+        branch: String,
+    },
+    GetMountBranch {
+        mountpoint: String,
+    },
     List,
     Shutdown,
 }
@@ -124,8 +139,13 @@ impl Daemon {
         &self.socket_path
     }
 
-    pub fn spawn_mount(&self, branch_name: &str, mountpoint: &Path) -> Result<()> {
-        let fs = BranchFs::new(self.manager.clone(), branch_name.to_string());
+    pub fn spawn_mount(
+        &self,
+        branch_name: &str,
+        mountpoint: &Path,
+        passthrough: bool,
+    ) -> Result<()> {
+        let fs = BranchFs::new(self.manager.clone(), branch_name.to_string(), passthrough);
         let options = vec![
             MountOption::FSName("branchfs".to_string()),
             MountOption::DefaultPermissions,
@@ -284,12 +304,16 @@ impl Daemon {
 
     fn handle_request(&self, request: Request) -> Response {
         match request {
-            Request::Mount { branch, mountpoint } => {
+            Request::Mount {
+                branch,
+                mountpoint,
+                passthrough,
+            } => {
                 let path = PathBuf::from(&mountpoint);
                 if let Err(e) = fs::create_dir_all(&path) {
                     return Response::error(&format!("Failed to create mountpoint: {}", e));
                 }
-                match self.spawn_mount(&branch, &path) {
+                match self.spawn_mount(&branch, &path, passthrough) {
                     Ok(()) => Response::success(),
                     Err(e) => Response::error(&format!("{}", e)),
                 }

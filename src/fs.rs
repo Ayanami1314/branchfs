@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    BackingId, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyIoctl, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use parking_lot::RwLock;
 
@@ -129,10 +129,16 @@ pub struct BranchFs {
     /// Cached write fd — avoids re-open on consecutive writes to the same
     /// delta file (after COW).
     write_cache: WriteFileCache,
+    /// Whether FUSE passthrough mode is enabled (--passthrough flag).
+    passthrough_enabled: bool,
+    /// Monotonically increasing file handle counter for passthrough opens.
+    next_fh: AtomicU64,
+    /// BackingId objects kept alive until release() — one per passthrough open().
+    backing_ids: HashMap<u64, BackingId>,
 }
 
 impl BranchFs {
-    pub fn new(manager: Arc<BranchManager>, branch_name: String) -> Self {
+    pub fn new(manager: Arc<BranchManager>, branch_name: String, passthrough: bool) -> Self {
         let current_epoch = manager.get_epoch();
         Self {
             manager,
@@ -147,6 +153,9 @@ impl BranchFs {
             gid: AtomicU32::new(nix::unistd::getgid().as_raw()),
             open_cache: OpenFileCache::new(),
             write_cache: WriteFileCache::new(),
+            passthrough_enabled: passthrough,
+            next_fh: AtomicU64::new(1),
+            backing_ids: HashMap::new(),
         }
     }
 
@@ -212,6 +221,64 @@ impl BranchFs {
         }
     }
 
+    /// Attempt to open a file with FUSE passthrough. Falls back to non-passthrough on failure.
+    fn try_open_passthrough(
+        &mut self,
+        _ino: u64,
+        flags: i32,
+        branch: &str,
+        rel_path: &str,
+        resolved: &std::path::Path,
+        reply: ReplyOpen,
+    ) {
+        let is_writable = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+
+        // For writable opens, do eager COW — the kernel will write directly to
+        // the backing file, bypassing our write() callback.
+        let backing_path = if is_writable {
+            match self.ensure_cow_for_branch(branch, rel_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    // Fallback to non-passthrough
+                    reply.opened(0, 0);
+                    return;
+                }
+            }
+        } else {
+            resolved.to_path_buf()
+        };
+
+        // Open the backing file
+        let open_result = if is_writable {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&backing_path)
+        } else {
+            File::open(&backing_path)
+        };
+        let file = match open_result {
+            Ok(f) => f,
+            Err(_) => {
+                reply.opened(0, 0);
+                return;
+            }
+        };
+
+        // Register the fd with the kernel
+        let backing_id = match reply.open_backing(&file) {
+            Ok(id) => id,
+            Err(_) => {
+                reply.opened(0, 0);
+                return;
+            }
+        };
+
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        reply.opened_passthrough(fh, 0, &backing_id);
+        self.backing_ids.insert(fh, backing_id);
+    }
+
     /// Classify an inode number. Returns None for root and CTL_INO (handled separately).
     fn classify_ino(&self, ino: u64) -> Option<PathContext> {
         if ino == ROOT_INO {
@@ -230,17 +297,31 @@ impl BranchFs {
 }
 
 impl Filesystem for BranchFs {
-    fn init(
-        &mut self,
-        req: &Request,
-        _config: &mut fuser::KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    fn init(&mut self, req: &Request, config: &mut fuser::KernelConfig) -> Result<(), libc::c_int> {
         // The init request may come from the kernel (uid=0) rather than the
         // mounting user, so only override the process-derived defaults when
         // the request carries a real (non-root) uid.
         if req.uid() != 0 {
             self.uid.store(req.uid(), Ordering::Relaxed);
             self.gid.store(req.gid(), Ordering::Relaxed);
+        }
+
+        if self.passthrough_enabled {
+            if let Err(e) = config.add_capabilities(fuser::consts::FUSE_PASSTHROUGH) {
+                log::warn!(
+                    "Kernel does not support FUSE_PASSTHROUGH (unsupported bits: {:#x}), disabling",
+                    e
+                );
+                self.passthrough_enabled = false;
+            } else if let Err(e) = config.set_max_stack_depth(2) {
+                log::warn!(
+                    "Failed to set max_stack_depth (max: {}), disabling passthrough",
+                    e
+                );
+                self.passthrough_enabled = false;
+            } else {
+                log::info!("FUSE passthrough enabled");
+            }
         }
 
         Ok(())
@@ -1037,7 +1118,7 @@ impl Filesystem for BranchFs {
         self.unlink(_req, parent, name, reply);
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         // Control file is always openable (no epoch check)
         if ino == CTL_INO {
             reply.opened(0, 0);
@@ -1070,11 +1151,19 @@ impl Filesystem for BranchFs {
                     reply.error(libc::ENOENT);
                     return;
                 }
-                if self.resolve_for_branch(&branch, &rel_path).is_some() {
-                    self.manager.register_opened_inode(&branch, ino);
-                    reply.opened(0, 0);
+                let resolved = match self.resolve_for_branch(&branch, &rel_path) {
+                    Some(p) => p,
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                };
+                self.manager.register_opened_inode(&branch, ino);
+
+                if self.passthrough_enabled {
+                    self.try_open_passthrough(ino, flags, &branch, &rel_path, &resolved, reply);
                 } else {
-                    reply.error(libc::ENOENT);
+                    reply.opened(0, 0);
                 }
             }
             _ => {
@@ -1083,15 +1172,39 @@ impl Filesystem for BranchFs {
                     reply.error(libc::ESTALE);
                     return;
                 }
-                if self.resolve(&path).is_some() {
-                    self.manager
-                        .register_opened_inode(&self.get_branch_name(), ino);
-                    reply.opened(0, 0);
+                let resolved = match self.resolve(&path) {
+                    Some(p) => p,
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                };
+                let branch_name = self.get_branch_name();
+                self.manager.register_opened_inode(&branch_name, ino);
+
+                if self.passthrough_enabled {
+                    self.try_open_passthrough(ino, flags, &branch_name, &path, &resolved, reply);
                 } else {
-                    reply.error(libc::ENOENT);
+                    reply.opened(0, 0);
                 }
             }
         }
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if fh != 0 {
+            self.backing_ids.remove(&fh);
+        }
+        reply.ok();
     }
 
     fn setattr(
