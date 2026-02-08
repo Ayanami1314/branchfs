@@ -21,3 +21,4 @@ parking_lot = "0.12"
 dashmap = "5"
 anyhow = "1"
 thiserror = "1"
+uuid = { version = "1", features = ["v4"] }

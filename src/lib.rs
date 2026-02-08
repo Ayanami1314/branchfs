@@ -13,3 +13,4 @@ pub use daemon::{
     Response,
 };
 pub use error::{BranchError, Result};
+pub use fs::{FS_IOC_BRANCH_ABORT, FS_IOC_BRANCH_COMMIT, FS_IOC_BRANCH_CREATE};

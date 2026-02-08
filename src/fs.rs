@@ -24,8 +24,9 @@ use crate::storage;
 pub(crate) const TTL: Duration = Duration::from_secs(0);
 pub(crate) const BLOCK_SIZE: u32 = 512;
 
-pub const BRANCHFS_IOC_COMMIT: u32 = 0x4201;
-pub const BRANCHFS_IOC_ABORT: u32 = 0x4202;
+pub const FS_IOC_BRANCH_CREATE: u32 = 0x6200; // _IO('b', 0)
+pub const FS_IOC_BRANCH_COMMIT: u32 = 0x6201; // _IO('b', 1)
+pub const FS_IOC_BRANCH_ABORT: u32 = 0x6202; // _IO('b', 2)
 
 pub(crate) const CTL_FILE: &str = ".branchfs_ctl";
 pub(crate) const CTL_INO: u64 = u64::MAX - 1;
@@ -1227,7 +1228,25 @@ impl Filesystem for BranchFs {
     ) {
         let branch_name = self.get_branch_name();
         match cmd {
-            BRANCHFS_IOC_COMMIT => {
+            FS_IOC_BRANCH_CREATE => {
+                let name = format!("branch-{}", uuid::Uuid::new_v4());
+                log::info!("ioctl: CREATE branch '{}' from '{}'", name, branch_name);
+                match self.manager.create_branch(&name, &branch_name) {
+                    Ok(()) => {
+                        self.switch_to_branch(&name);
+                        log::info!("Switched to new branch '{}'", name);
+                        // _IO encoding has no data direction, so we cannot
+                        // return data through restricted FUSE ioctl.  The
+                        // mount is already switched to the new branch.
+                        reply.ioctl(0, &[])
+                    }
+                    Err(e) => {
+                        log::error!("create branch failed: {}", e);
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            FS_IOC_BRANCH_COMMIT => {
                 log::info!("ioctl: COMMIT for branch '{}'", branch_name);
                 match self.manager.commit(&branch_name) {
                     Ok(parent) => {
@@ -1241,7 +1260,7 @@ impl Filesystem for BranchFs {
                     }
                 }
             }
-            BRANCHFS_IOC_ABORT => {
+            FS_IOC_BRANCH_ABORT => {
                 log::info!("ioctl: ABORT for branch '{}'", branch_name);
                 match self.manager.abort(&branch_name) {
                     Ok(parent) => {
