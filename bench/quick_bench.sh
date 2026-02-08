@@ -22,8 +22,16 @@ fi
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
+PASSTHROUGH_FLAG=""
+if [ "$(id -u)" = "0" ]; then
+    PASSTHROUGH_FLAG="--passthrough"
+fi
+
 echo "Using branchfs: $BRANCHFS"
 echo "Temp dir: $TMPDIR"
+if [ -n "$PASSTHROUGH_FLAG" ]; then
+    echo "Passthrough: enabled (root)"
+fi
 
 # Helper to measure time in microseconds using high-res timer
 time_us() {
@@ -65,7 +73,7 @@ for num_files in 100 1000 10000; do
     done
 
     # Mount
-    $BRANCHFS mount --base "$BASE" --storage "$STORAGE" "$MNT"
+    $BRANCHFS mount --base "$BASE" --storage "$STORAGE" $PASSTHROUGH_FLAG "$MNT"
     sleep 0.2
 
     # Measure branch creation (average of 5)
@@ -100,7 +108,7 @@ for mod_kb in 1 10 100 1000; do
     STORAGE="$TMPDIR/commit_storage_$mod_kb"
     mkdir -p "$MNT" "$STORAGE"
 
-    $BRANCHFS mount --base "$BASE" --storage "$STORAGE" "$MNT"
+    $BRANCHFS mount --base "$BASE" --storage "$STORAGE" $PASSTHROUGH_FLAG "$MNT"
     sleep 0.1
 
     $BRANCHFS create "bench" "$MNT" --storage "$STORAGE"
@@ -128,7 +136,7 @@ for mod_kb in 1 100 1000; do
     STORAGE="$TMPDIR/abort_storage_$mod_kb"
     mkdir -p "$MNT" "$STORAGE"
 
-    $BRANCHFS mount --base "$BASE" --storage "$STORAGE" "$MNT"
+    $BRANCHFS mount --base "$BASE" --storage "$STORAGE" $PASSTHROUGH_FLAG "$MNT"
     sleep 0.1
 
     $BRANCHFS create "bench" "$MNT" --storage "$STORAGE"
@@ -158,7 +166,7 @@ mkdir -p "$MNT" "$STORAGE"
 # Create test file
 dd if=/dev/urandom of="$BASE/testfile.bin" bs=1M count=1 2>/dev/null
 
-$BRANCHFS mount --base "$BASE" --storage "$STORAGE" "$MNT"
+$BRANCHFS mount --base "$BASE" --storage "$STORAGE" $PASSTHROUGH_FLAG "$MNT"
 sleep 0.1
 $BRANCHFS create "bench" "$MNT" --storage "$STORAGE"
 
@@ -186,7 +194,7 @@ MNT="$TMPDIR/switch_mnt"
 STORAGE="$TMPDIR/switch_storage"
 mkdir -p "$MNT" "$STORAGE"
 
-$BRANCHFS mount --base "$BASE" --storage "$STORAGE" "$MNT"
+$BRANCHFS mount --base "$BASE" --storage "$STORAGE" $PASSTHROUGH_FLAG "$MNT"
 sleep 0.1
 
 # Create multiple branches

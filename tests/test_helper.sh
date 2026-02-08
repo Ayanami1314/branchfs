@@ -89,7 +89,11 @@ trap cleanup EXIT
 
 # Mount the filesystem
 do_mount() {
-    "$BRANCHFS" mount --base "$TEST_BASE" --storage "$TEST_STORAGE" "$TEST_MNT"
+    local extra_args=()
+    if [[ "$(id -u)" == "0" ]]; then
+        extra_args+=(--passthrough)
+    fi
+    "$BRANCHFS" mount --base "$TEST_BASE" --storage "$TEST_STORAGE" "${extra_args[@]}" "$TEST_MNT"
     sleep 0.5  # Give FUSE time to initialize
 }
 
