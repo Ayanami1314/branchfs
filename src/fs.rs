@@ -576,6 +576,20 @@ impl Filesystem for BranchFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
+        // Reading root ctl file returns the current branch name
+        if ino == CTL_INO {
+            let branch = self.get_branch_name();
+            let bytes = branch.as_bytes();
+            let off = offset as usize;
+            if off >= bytes.len() {
+                reply.data(&[]);
+            } else {
+                let end = (off + size as usize).min(bytes.len());
+                reply.data(&bytes[off..end]);
+            }
+            return;
+        }
+
         let epoch = self.current_epoch.load(Ordering::SeqCst);
 
         // Fast path: reuse cached fd for the same inode+epoch (avoids
