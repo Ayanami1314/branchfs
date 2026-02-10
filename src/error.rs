@@ -23,6 +23,9 @@ pub enum BranchError {
     #[error("cannot commit/abort non-leaf branch '{0}'")]
     NotALeaf(String),
 
+    #[error("commit conflict: branch '{0}' is stale (another sibling already committed)")]
+    Conflict(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

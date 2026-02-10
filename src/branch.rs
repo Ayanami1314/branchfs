@@ -18,10 +18,19 @@ pub struct Branch {
     pub files_dir: PathBuf,
     pub tombstones_file: PathBuf,
     tombstones: RwLock<HashSet<String>>,
+    /// How many children have been committed (merged) into this branch.
+    pub commit_count: AtomicU64,
+    /// Parent's commit_count at the time this branch was forked.
+    pub parent_version_at_fork: u64,
 }
 
 impl Branch {
-    pub fn new(name: &str, parent: Option<&str>, storage_path: &Path) -> Result<Self> {
+    pub fn new(
+        name: &str,
+        parent: Option<&str>,
+        storage_path: &Path,
+        parent_version_at_fork: u64,
+    ) -> Result<Self> {
         let branch_dir = storage_path.join("branches").join(name);
         let files_dir = branch_dir.join("files");
         let tombstones_file = branch_dir.join("tombstones");
@@ -39,6 +48,8 @@ impl Branch {
             files_dir,
             tombstones_file,
             tombstones: RwLock::new(tombstones),
+            commit_count: AtomicU64::new(0),
+            parent_version_at_fork,
         })
     }
 
@@ -145,7 +156,7 @@ impl BranchManager {
 
         // Always start fresh with just the "main" branch
         let mut branches = std::collections::HashMap::new();
-        let main_branch = Branch::new("main", None, &storage_path)?;
+        let main_branch = Branch::new("main", None, &storage_path, 0)?;
         branches.insert("main".to_string(), main_branch);
 
         Ok(Self {
@@ -169,11 +180,12 @@ impl BranchManager {
             return Err(BranchError::AlreadyExists(name.to_string()));
         }
 
-        if !branches.contains_key(parent) {
-            return Err(BranchError::ParentNotFound(parent.to_string()));
-        }
+        let parent_branch = branches
+            .get(parent)
+            .ok_or_else(|| BranchError::ParentNotFound(parent.to_string()))?;
+        let parent_version = parent_branch.commit_count.load(Ordering::SeqCst);
 
-        let branch = Branch::new(name, Some(parent), &self.storage_path)?;
+        let branch = Branch::new(name, Some(parent), &self.storage_path, parent_version)?;
         branches.insert(name.to_string(), branch);
 
         let elapsed = start.elapsed();
@@ -405,6 +417,20 @@ impl BranchManager {
             .clone()
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
+        let child_version_at_fork = branch.parent_version_at_fork;
+
+        // First-wins conflict detection: check that the parent hasn't had
+        // another sibling committed since this branch was forked.
+        {
+            let parent = branches
+                .get(&parent_name)
+                .ok_or_else(|| BranchError::NotFound(parent_name.to_string()))?;
+            let current_parent_version = parent.commit_count.load(Ordering::SeqCst);
+            if current_parent_version != child_version_at_fork {
+                return Err(BranchError::Conflict(branch_name.to_string()));
+            }
+        }
+
         let child_tombstones = branch.get_tombstones();
         let child_files_dir = branch.files_dir.clone();
 
@@ -436,6 +462,11 @@ impl BranchManager {
                 let _ = fs::copy(src_path, &dest);
                 num_files += 1;
             })?;
+
+            // Increment parent's commit_count (first-wins bookkeeping)
+            if let Some(main_branch) = branches.get("main") {
+                main_branch.commit_count.fetch_add(1, Ordering::SeqCst);
+            }
 
             // Remove branch
             branches.remove(branch_name);
@@ -500,6 +531,9 @@ impl BranchManager {
 
             // Write updated tombstones to parent
             parent.set_tombstones(parent_tombstones)?;
+
+            // Increment parent's commit_count (first-wins bookkeeping)
+            parent.commit_count.fetch_add(1, Ordering::SeqCst);
 
             // Remove child branch
             branches.remove(branch_name);

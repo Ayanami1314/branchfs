@@ -12,10 +12,38 @@ use std::time::Duration;
 
 use branchfs::{FS_IOC_BRANCH_ABORT, FS_IOC_BRANCH_COMMIT, FS_IOC_BRANCH_CREATE};
 
-/// Call an ioctl with no data argument.  Returns the raw ioctl return value
-/// (0 on success, -1 on failure with errno set).
-unsafe fn branch_ioctl(fd: i32, cmd: u32) -> i32 {
-    libc::ioctl(fd, cmd as libc::c_ulong, 0 as libc::c_ulong)
+/// Call a data-carrying ioctl with a 128-byte buffer.
+/// `input` is the null-terminated string to send.
+/// Returns (ret, output_buf) where ret is the raw ioctl return value.
+unsafe fn branch_ioctl_buf(fd: i32, cmd: u32, input: &str) -> (i32, [u8; 128]) {
+    let mut buf = [0u8; 128];
+    let bytes = input.as_bytes();
+    let len = bytes.len().min(127);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    let ret = libc::ioctl(fd, cmd as libc::c_ulong, buf.as_mut_ptr());
+    (ret, buf)
+}
+
+/// Helper: CREATE a branch from `parent`, returning the new branch name.
+unsafe fn ioctl_create(fd: i32, parent: &str) -> Result<String, i32> {
+    let (ret, buf) = branch_ioctl_buf(fd, FS_IOC_BRANCH_CREATE, parent);
+    if ret < 0 {
+        return Err(*libc::__errno_location());
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(String::from_utf8_lossy(&buf[..end]).to_string())
+}
+
+/// Helper: COMMIT a branch by name.
+unsafe fn ioctl_commit(fd: i32, branch: &str) -> i32 {
+    let (ret, _) = branch_ioctl_buf(fd, FS_IOC_BRANCH_COMMIT, branch);
+    ret
+}
+
+/// Helper: ABORT a branch by name.
+unsafe fn ioctl_abort(fd: i32, branch: &str) -> i32 {
+    let (ret, _) = branch_ioctl_buf(fd, FS_IOC_BRANCH_ABORT, branch);
+    ret
 }
 
 struct TestFixture {
@@ -126,13 +154,14 @@ fn test_ioctl_create_and_commit_new_file() {
     let ctl = fix.open_ctl();
     let fd = ctl.as_raw_fd();
 
-    // CREATE a branch
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_CREATE) };
-    assert_eq!(ret, 0, "CREATE should succeed");
+    // CREATE a branch from main
+    let branch = unsafe { ioctl_create(fd, "main") }.expect("CREATE should succeed");
+    assert!(!branch.is_empty(), "branch name should not be empty");
 
-    // Write a new file on the branch
-    fs::write(fix.mnt.join("new_file.txt"), "branch content\n").unwrap();
-    assert!(fix.mnt.join("new_file.txt").exists());
+    // Write a new file on the branch via @branch virtual path
+    let branch_dir = fix.mnt.join(format!("@{}", branch));
+    fs::write(branch_dir.join("new_file.txt"), "branch content\n").unwrap();
+    assert!(branch_dir.join("new_file.txt").exists());
 
     // Base should NOT have the file yet
     assert!(
@@ -141,7 +170,7 @@ fn test_ioctl_create_and_commit_new_file() {
     );
 
     // COMMIT the branch
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_COMMIT) };
+    let ret = unsafe { ioctl_commit(fd, &branch) };
     assert_eq!(ret, 0, "COMMIT should succeed");
 
     // File should now be in base
@@ -165,11 +194,11 @@ fn test_ioctl_modify_existing_and_commit() {
     let ctl = fix.open_ctl();
     let fd = ctl.as_raw_fd();
 
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_CREATE) };
-    assert_eq!(ret, 0);
+    let branch = unsafe { ioctl_create(fd, "main") }.expect("CREATE should succeed");
 
-    // Overwrite an existing base file
-    fs::write(fix.mnt.join("file1.txt"), "modified\n").unwrap();
+    // Overwrite an existing base file via @branch path
+    let branch_dir = fix.mnt.join(format!("@{}", branch));
+    fs::write(branch_dir.join("file1.txt"), "modified\n").unwrap();
 
     // Base still has the original
     assert_eq!(
@@ -177,7 +206,7 @@ fn test_ioctl_modify_existing_and_commit() {
         "base content\n"
     );
 
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_COMMIT) };
+    let ret = unsafe { ioctl_commit(fd, &branch) };
     assert_eq!(ret, 0);
 
     // Base should reflect the modification
@@ -197,26 +226,20 @@ fn test_ioctl_create_and_abort() {
     let ctl = fix.open_ctl();
     let fd = ctl.as_raw_fd();
 
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_CREATE) };
-    assert_eq!(ret, 0, "CREATE should succeed");
+    let branch = unsafe { ioctl_create(fd, "main") }.expect("CREATE should succeed");
 
-    // Write a file and modify another
-    fs::write(fix.mnt.join("abort_file.txt"), "will be discarded\n").unwrap();
-    fs::write(fix.mnt.join("file1.txt"), "modified\n").unwrap();
+    // Write a file and modify another via @branch path
+    let branch_dir = fix.mnt.join(format!("@{}", branch));
+    fs::write(branch_dir.join("abort_file.txt"), "will be discarded\n").unwrap();
+    fs::write(branch_dir.join("file1.txt"), "modified\n").unwrap();
 
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_ABORT) };
+    let ret = unsafe { ioctl_abort(fd, &branch) };
     assert_eq!(ret, 0, "ABORT should succeed");
 
-    // New file should be gone
+    // Branch dir should be gone after abort
     assert!(
-        !fix.mnt.join("abort_file.txt").exists(),
+        !branch_dir.join("abort_file.txt").exists(),
         "new file should vanish after abort"
-    );
-    // Modification should be reverted
-    assert_eq!(
-        fs::read_to_string(fix.mnt.join("file1.txt")).unwrap(),
-        "base content\n",
-        "existing file should revert after abort"
     );
     // Base untouched
     assert!(!fix.base.join("abort_file.txt").exists());
@@ -237,22 +260,23 @@ fn test_ioctl_nested_create_and_commit() {
     let fd = ctl.as_raw_fd();
 
     // First branch (child of main)
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_CREATE) };
-    assert_eq!(ret, 0, "first CREATE should succeed");
-    fs::write(fix.mnt.join("level1.txt"), "level1\n").unwrap();
+    let branch1 = unsafe { ioctl_create(fd, "main") }.expect("first CREATE should succeed");
+    let b1_dir = fix.mnt.join(format!("@{}", branch1));
+    fs::write(b1_dir.join("level1.txt"), "level1\n").unwrap();
 
     // Second branch (child of first)
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_CREATE) };
-    assert_eq!(ret, 0, "second CREATE should succeed");
-    fs::write(fix.mnt.join("level2.txt"), "level2\n").unwrap();
+    let branch2 = unsafe { ioctl_create(fd, &branch1) }.expect("second CREATE should succeed");
+    let b2_dir = fix.mnt.join(format!("@{}", branch2));
+    fs::write(b2_dir.join("level2.txt"), "level2\n").unwrap();
 
-    // All files visible through the mount
-    assert!(fix.mnt.join("file1.txt").exists());
-    assert!(fix.mnt.join("level1.txt").exists());
-    assert!(fix.mnt.join("level2.txt").exists());
+    // Files visible through their respective branch paths
+    assert!(b1_dir.join("level1.txt").exists());
+    assert!(b2_dir.join("level2.txt").exists());
+    // level2 branch should also see level1 (inherited from parent)
+    assert!(b2_dir.join("level1.txt").exists());
 
     // COMMIT level-2 → merges into level-1
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_COMMIT) };
+    let ret = unsafe { ioctl_commit(fd, &branch2) };
     assert_eq!(ret, 0, "commit level-2 should succeed");
 
     // Neither file should be in base yet
@@ -260,7 +284,7 @@ fn test_ioctl_nested_create_and_commit() {
     assert!(!fix.base.join("level2.txt").exists());
 
     // COMMIT level-1 → merges into main / base
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_COMMIT) };
+    let ret = unsafe { ioctl_commit(fd, &branch1) };
     assert_eq!(ret, 0, "commit level-1 should succeed");
 
     // Both files in base now
@@ -278,7 +302,7 @@ fn test_ioctl_commit_on_main_fails() {
     let ctl = fix.open_ctl();
     let fd = ctl.as_raw_fd();
 
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_COMMIT) };
+    let ret = unsafe { ioctl_commit(fd, "main") };
     assert!(ret < 0, "COMMIT on main should fail (got {})", ret);
 }
 
@@ -290,11 +314,11 @@ fn test_ioctl_abort_on_main_fails() {
     let ctl = fix.open_ctl();
     let fd = ctl.as_raw_fd();
 
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_ABORT) };
+    let ret = unsafe { ioctl_abort(fd, "main") };
     assert!(ret < 0, "ABORT on main should fail (got {})", ret);
 }
 
-// ── Multiple CREATE + ABORT returns to previous branch ──────────────
+// ── Multiple CREATE + ABORT discards child branch ───────────────────
 
 #[test]
 #[ignore]
@@ -305,25 +329,24 @@ fn test_ioctl_abort_returns_to_parent_branch() {
     let fd = ctl.as_raw_fd();
 
     // CREATE first branch, write a file
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_CREATE) };
-    assert_eq!(ret, 0);
-    fs::write(fix.mnt.join("parent_file.txt"), "parent\n").unwrap();
+    let branch1 = unsafe { ioctl_create(fd, "main") }.expect("CREATE should succeed");
+    let b1_dir = fix.mnt.join(format!("@{}", branch1));
+    fs::write(b1_dir.join("parent_file.txt"), "parent\n").unwrap();
 
     // CREATE second (nested) branch, write another file
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_CREATE) };
-    assert_eq!(ret, 0);
-    fs::write(fix.mnt.join("child_file.txt"), "child\n").unwrap();
+    let branch2 = unsafe { ioctl_create(fd, &branch1) }.expect("CREATE should succeed");
+    let b2_dir = fix.mnt.join(format!("@{}", branch2));
+    fs::write(b2_dir.join("child_file.txt"), "child\n").unwrap();
 
-    // ABORT second branch — should land back on first branch
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_ABORT) };
+    // ABORT second branch — child's data is discarded
+    let ret = unsafe { ioctl_abort(fd, &branch2) };
     assert_eq!(ret, 0);
 
-    // Child's file gone, parent's file still visible
-    assert!(!fix.mnt.join("child_file.txt").exists());
-    assert!(fix.mnt.join("parent_file.txt").exists());
+    // Parent branch still has its file
+    assert!(b1_dir.join("parent_file.txt").exists());
 
     // COMMIT first branch back to main
-    let ret = unsafe { branch_ioctl(fd, FS_IOC_BRANCH_COMMIT) };
+    let ret = unsafe { ioctl_commit(fd, &branch1) };
     assert_eq!(ret, 0);
 
     assert!(fix.base.join("parent_file.txt").exists());

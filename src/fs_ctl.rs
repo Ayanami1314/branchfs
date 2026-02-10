@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use fuser::ReplyWrite;
 
+use crate::error::BranchError;
 use crate::fs::BranchFs;
 
 impl BranchFs {
@@ -71,9 +72,16 @@ impl BranchFs {
 
         match result {
             Ok(parent) => {
+                // Root ctl always operates on the current mount branch, which
+                // gets deleted on commit/abort.  We must switch to the parent
+                // so the mount stays valid.
                 self.switch_to_branch(&parent);
                 log::info!("Switched to branch '{}' after {}", parent, cmd_lower);
                 reply.written(data.len() as u32)
+            }
+            Err(BranchError::Conflict(_)) => {
+                log::warn!("Root ctl {} conflict for '{}'", cmd_lower, branch_name);
+                reply.error(libc::ESTALE);
             }
             Err(e) => {
                 log::error!("Control command failed: {}", e);
@@ -104,14 +112,29 @@ impl BranchFs {
                 self.inodes.clear_prefix(&format!("/@{}", branch));
                 self.current_epoch
                     .store(self.manager.get_epoch(), Ordering::SeqCst);
-                *self.branch_name.write() = parent.clone();
-                log::info!(
-                    "Branch ctl {} succeeded for '{}', switched to '{}'",
-                    cmd_lower,
-                    branch,
-                    parent
-                );
+                // Only switch the mount if the operated branch is the current mount branch
+                let current = self.get_branch_name();
+                if current == branch {
+                    *self.branch_name.write() = parent.clone();
+                    log::info!(
+                        "Branch ctl {} succeeded for '{}', switched to '{}'",
+                        cmd_lower,
+                        branch,
+                        parent
+                    );
+                } else {
+                    log::info!(
+                        "Branch ctl {} succeeded for '{}' (mount stays on '{}')",
+                        cmd_lower,
+                        branch,
+                        current
+                    );
+                }
                 reply.written(data.len() as u32)
+            }
+            Err(BranchError::Conflict(_)) => {
+                log::warn!("Branch ctl {} conflict for '{}'", cmd_lower, branch);
+                reply.error(libc::ESTALE);
             }
             Err(e) => {
                 log::error!("Branch ctl command failed: {}", e);
