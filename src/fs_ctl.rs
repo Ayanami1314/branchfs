@@ -58,7 +58,10 @@ impl BranchFs {
             log::info!("Switched to branch '{}'", new_branch);
             reply.written(data.len() as u32);
         } else {
-            log::warn!("Unknown root ctl command: '{}' (use /@branch/.branchfs_ctl for commit/abort)", cmd);
+            log::warn!(
+                "Unknown root ctl command: '{}' (use /@branch/.branchfs_ctl for commit/abort)",
+                cmd
+            );
             reply.error(libc::EINVAL);
         }
     }
@@ -88,8 +91,7 @@ impl BranchFs {
                 // Only switch the mount if the operated branch is the current mount branch
                 let current = self.get_branch_name();
                 if current == branch {
-                    self.manager
-                        .switch_mount_branch(&self.mountpoint, &parent);
+                    self.manager.switch_mount_branch(&self.mountpoint, &parent);
                     log::info!(
                         "Branch ctl {} succeeded for '{}', switched to '{}'",
                         cmd_lower,

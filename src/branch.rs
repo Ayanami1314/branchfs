@@ -189,17 +189,13 @@ impl BranchManager {
     pub fn switch_mount_branch(&self, mountpoint: &Path, new_branch: &str) {
         // Lock order: mount_branches → notifiers (never reversed)
         let mut mb = self.mount_branches.write();
-        let old_branch = mb
-            .insert(mountpoint.to_path_buf(), new_branch.to_string());
+        let old_branch = mb.insert(mountpoint.to_path_buf(), new_branch.to_string());
 
         // Re-key notifier from (old, mount) → (new, mount)
         if let Some(old) = old_branch {
             let mut notifiers = self.notifiers.lock();
             if let Some(notifier) = notifiers.remove(&(old.clone(), mountpoint.to_path_buf())) {
-                notifiers.insert(
-                    (new_branch.to_string(), mountpoint.to_path_buf()),
-                    notifier,
-                );
+                notifiers.insert((new_branch.to_string(), mountpoint.to_path_buf()), notifier);
             }
             log::info!(
                 "switch_mount_branch: {:?} '{}' -> '{}'",
@@ -398,7 +394,6 @@ impl BranchManager {
             }
         }
     }
-
 
     pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
         let branches = self.branches.read();

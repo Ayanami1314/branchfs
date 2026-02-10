@@ -27,7 +27,7 @@ pub(crate) const BLOCK_SIZE: u32 = 512;
 
 pub const FS_IOC_BRANCH_CREATE: u32 = 0x8080_6200; // _IOR('b', 0, [u8; 128])
 pub const FS_IOC_BRANCH_COMMIT: u32 = 0x0000_6201; // _IO ('b', 1)
-pub const FS_IOC_BRANCH_ABORT: u32 = 0x0000_6202;  // _IO ('b', 2)
+pub const FS_IOC_BRANCH_ABORT: u32 = 0x0000_6202; // _IO ('b', 2)
 
 pub(crate) const CTL_FILE: &str = ".branchfs_ctl";
 pub(crate) const CTL_INO: u64 = u64::MAX - 1;
@@ -825,7 +825,6 @@ impl Filesystem for BranchFs {
                 // Add .branchfs_ctl
                 let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
                 entries.push((ctl_ino, FileType::RegularFile, CTL_FILE.to_string()));
-
 
                 for (i, (e_ino, kind, name)) in
                     entries.into_iter().enumerate().skip(offset as usize)

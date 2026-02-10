@@ -224,7 +224,9 @@ fn main() -> Result<()> {
 
             // Write to the per-branch ctl file
             // (FUSE handler does commit + switch_mount_branch internally)
-            let ctl_path = mountpoint.join(format!("@{}", branch)).join(".branchfs_ctl");
+            let ctl_path = mountpoint
+                .join(format!("@{}", branch))
+                .join(".branchfs_ctl");
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&ctl_path)
@@ -250,7 +252,9 @@ fn main() -> Result<()> {
 
             // Write to the per-branch ctl file
             // (FUSE handler does abort + switch_mount_branch internally)
-            let ctl_path = mountpoint.join(format!("@{}", branch)).join(".branchfs_ctl");
+            let ctl_path = mountpoint
+                .join(format!("@{}", branch))
+                .join(".branchfs_ctl");
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&ctl_path)

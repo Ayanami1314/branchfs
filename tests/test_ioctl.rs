@@ -334,8 +334,7 @@ fn test_ioctl_abort_returns_to_parent_branch() {
 
     // CREATE second (nested) branch via branch1's ctl, write another file
     let b1_ctl = fix.open_branch_ctl(&branch1);
-    let branch2 =
-        unsafe { ioctl_create(b1_ctl.as_raw_fd()) }.expect("CREATE should succeed");
+    let branch2 = unsafe { ioctl_create(b1_ctl.as_raw_fd()) }.expect("CREATE should succeed");
     let b2_dir = fix.mnt.join(format!("@{}", branch2));
     fs::write(b2_dir.join("child_file.txt"), "child\n").unwrap();
 
