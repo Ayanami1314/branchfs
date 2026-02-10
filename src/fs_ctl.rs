@@ -34,95 +34,32 @@ impl BranchFs {
         None
     }
 
-    /// Parse a `cmd:arg` style control command.
-    /// Returns `(action, target_branch)`.
-    fn parse_ctl_command<'a>(&self, cmd: &'a str) -> Option<(&'a str, String)> {
-        if let Some(pos) = cmd.find(':') {
-            let action = cmd[..pos].trim();
-            let arg = cmd[pos + 1..].trim();
-            if arg.is_empty() {
-                None
-            } else {
-                Some((action, arg.to_string()))
-            }
-        } else {
-            // Bare command — target is the current mount branch
-            Some((cmd.trim(), self.get_branch_name()))
-        }
-    }
-
     /// Handle a write to the root ctl file.
+    /// Only supports `switch:<branch_name>` — commit/abort go through
+    /// per-branch ctl files (`/@<branch>/.branchfs_ctl`).
     pub(crate) fn handle_root_ctl_write(&mut self, data: &[u8], reply: ReplyWrite) {
         let cmd = String::from_utf8_lossy(data).trim().to_string();
         let cmd_lower = cmd.to_lowercase();
-        log::info!("Control command: '{}'", cmd);
+        log::info!("Root ctl command: '{}'", cmd);
 
-        let (action, target) = match self.parse_ctl_command(&cmd_lower) {
-            Some(pair) => pair,
-            None => {
-                log::warn!("Empty argument in control command: {}", cmd);
+        if let Some(new_branch) = cmd_lower.strip_prefix("switch:") {
+            let new_branch = new_branch.trim();
+            if new_branch.is_empty() {
+                log::warn!("Empty branch name in switch command");
                 reply.error(libc::EINVAL);
                 return;
             }
-        };
-
-        match action {
-            "switch" => {
-                if !self.manager.is_branch_valid(&target) {
-                    log::warn!("Branch '{}' does not exist", target);
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-                self.switch_to_branch(&target);
-                log::info!("Switched to branch '{}'", target);
-                reply.written(data.len() as u32);
+            if !self.manager.is_branch_valid(new_branch) {
+                log::warn!("Branch '{}' does not exist", new_branch);
+                reply.error(libc::ENOENT);
+                return;
             }
-            "commit" | "abort" => {
-                let result = if action == "commit" {
-                    self.manager.commit(&target)
-                } else {
-                    self.manager.abort(&target)
-                };
-
-                match result {
-                    Ok(parent) => {
-                        self.inodes.clear_prefix(&format!("/@{}", target));
-                        // Only switch mount if the target was the current branch
-                        let current = self.get_branch_name();
-                        if current == target {
-                            self.switch_to_branch(&parent);
-                            log::info!(
-                                "Root ctl {} '{}', switched to '{}'",
-                                action,
-                                target,
-                                parent
-                            );
-                        } else {
-                            self.current_epoch
-                                .store(self.manager.get_epoch(), Ordering::SeqCst);
-                            log::info!(
-                                "Root ctl {} '{}' (mount stays on '{}')",
-                                action,
-                                target,
-                                current
-                            );
-                        }
-                        reply.written(data.len() as u32)
-                    }
-                    Err(BranchError::Conflict(_)) => {
-                        log::warn!("Root ctl {} conflict for '{}'", action, target);
-                        reply.error(libc::ESTALE);
-                    }
-                    Err(e) => {
-                        log::error!("Control command failed: {}", e);
-                        reply.error(libc::EIO);
-                    }
-                }
-            }
-            _ => {
-                log::warn!("Unknown control command: {}", cmd);
-                reply.error(libc::EINVAL);
-            }
+            self.switch_to_branch(new_branch);
+            log::info!("Switched to branch '{}'", new_branch);
+            reply.written(data.len() as u32);
+        } else {
+            log::warn!("Unknown root ctl command: '{}' (use /@branch/.branchfs_ctl for commit/abort)", cmd);
+            reply.error(libc::EINVAL);
         }
     }
 

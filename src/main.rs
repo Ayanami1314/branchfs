@@ -52,28 +52,20 @@ enum Commands {
         storage: PathBuf,
     },
 
-    /// Commit a branch (merges into parent)
+    /// Commit branch to base
     Commit {
-        /// Mount point
+        /// Mount point of the branch to commit
         mountpoint: PathBuf,
-
-        /// Branch to commit (default: current mount branch)
-        #[arg(long, short)]
-        branch: Option<String>,
 
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
     },
 
-    /// Abort a branch (discards changes)
+    /// Abort branch
     Abort {
-        /// Mount point
+        /// Mount point of the branch to abort
         mountpoint: PathBuf,
-
-        /// Branch to abort (default: current mount branch)
-        #[arg(long, short)]
-        branch: Option<String>,
 
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
@@ -108,16 +100,40 @@ fn send_request(storage: &Path, request: &Request) -> Result<Response> {
         .map_err(|e| anyhow::anyhow!("Failed to communicate with daemon: {}", e))
 }
 
-/// Get the current mount branch by reading the FUSE ctl file.
-fn get_current_branch(mountpoint: &Path) -> String {
-    let ctl_path = mountpoint.join(".branchfs_ctl");
-    match std::fs::read_to_string(&ctl_path) {
-        Ok(branch) => {
-            let trimmed = branch.trim();
-            if trimmed.is_empty() { "main".to_string() } else { trimmed.to_string() }
-        }
-        Err(_) => "main".to_string(),
+/// Get the current mount branch from the daemon.
+fn get_mount_branch(storage: &Path, mountpoint: &Path) -> Result<String> {
+    let resp = send_request(
+        storage,
+        &Request::GetMountBranch {
+            mountpoint: mountpoint.to_string_lossy().to_string(),
+        },
+    )?;
+    if !resp.ok {
+        anyhow::bail!("{}", resp.error.unwrap_or_else(|| "unknown error".into()));
     }
+    resp.data
+        .and_then(|d| d.as_str().map(|s| s.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("daemon returned no branch info"))
+}
+
+/// Look up the parent of a branch from the daemon's branch list.
+fn get_parent_of(storage: &Path, branch: &str) -> Result<String> {
+    let resp = send_request(storage, &Request::List)?;
+    if !resp.ok {
+        anyhow::bail!("{}", resp.error.unwrap_or_else(|| "unknown error".into()));
+    }
+    if let Some(data) = resp.data {
+        if let Some(branches) = data.as_array() {
+            for b in branches {
+                if b["name"].as_str() == Some(branch) {
+                    if let Some(parent) = b["parent"].as_str() {
+                        return Ok(parent.to_string());
+                    }
+                }
+            }
+        }
+    }
+    anyhow::bail!("Could not determine parent of branch '{}'", branch)
 }
 
 fn main() -> Result<()> {
@@ -224,67 +240,76 @@ fn main() -> Result<()> {
 
         Commands::Commit {
             mountpoint,
-            branch,
             storage,
         } => {
             let mountpoint = mountpoint.canonicalize()?;
             let storage = storage.canonicalize()?;
-            let ctl_path = mountpoint.join(".branchfs_ctl");
 
-            let target = branch.unwrap_or_else(|| get_current_branch(&mountpoint));
+            let branch = get_mount_branch(&storage, &mountpoint)?;
+            if branch == "main" {
+                anyhow::bail!("Cannot commit main branch");
+            }
 
+            // Pre-compute parent before commit (FUSE handler will switch to it)
+            let parent = get_parent_of(&storage, &branch)?;
+
+            // Write to the per-branch ctl file
+            let ctl_path = mountpoint.join(format!("@{}", branch)).join(".branchfs_ctl");
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&ctl_path)
-                .map_err(|e| anyhow::anyhow!("Failed to open control file: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to open branch control file: {}", e))?;
 
-            file.write_all(format!("commit:{}", target).as_bytes())
+            file.write_all(b"commit")
                 .map_err(|e| anyhow::anyhow!("Commit failed: {}", e))?;
 
-            // Notify daemon of the branch change (FUSE handler switches
-            // to parent only if target was the current mount branch).
-            let new_current = get_current_branch(&mountpoint);
+            // Notify daemon that mount switched to parent
             let _ = send_request(
                 &storage,
                 &Request::NotifySwitch {
                     mountpoint: mountpoint.to_string_lossy().to_string(),
-                    branch: new_current,
+                    branch: parent,
                 },
             );
 
-            println!("Committed branch '{}' at {:?}", target, mountpoint);
+            println!("Committed branch at {:?}", mountpoint);
         }
 
         Commands::Abort {
             mountpoint,
-            branch,
             storage,
         } => {
             let mountpoint = mountpoint.canonicalize()?;
             let storage = storage.canonicalize()?;
-            let ctl_path = mountpoint.join(".branchfs_ctl");
 
-            let target = branch.unwrap_or_else(|| get_current_branch(&mountpoint));
+            let branch = get_mount_branch(&storage, &mountpoint)?;
+            if branch == "main" {
+                anyhow::bail!("Cannot abort main branch");
+            }
 
+            // Pre-compute parent before abort (FUSE handler will switch to it)
+            let parent = get_parent_of(&storage, &branch)?;
+
+            // Write to the per-branch ctl file
+            let ctl_path = mountpoint.join(format!("@{}", branch)).join(".branchfs_ctl");
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&ctl_path)
-                .map_err(|e| anyhow::anyhow!("Failed to open control file: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to open branch control file: {}", e))?;
 
-            file.write_all(format!("abort:{}", target).as_bytes())
+            file.write_all(b"abort")
                 .map_err(|e| anyhow::anyhow!("Abort failed: {}", e))?;
 
-            // Notify daemon of the branch change
-            let new_current = get_current_branch(&mountpoint);
+            // Notify daemon that mount switched to parent
             let _ = send_request(
                 &storage,
                 &Request::NotifySwitch {
                     mountpoint: mountpoint.to_string_lossy().to_string(),
-                    branch: new_current,
+                    branch: parent,
                 },
             );
 
-            println!("Aborted branch '{}' at {:?}", target, mountpoint);
+            println!("Aborted branch at {:?}", mountpoint);
         }
 
         Commands::List { storage } => {
