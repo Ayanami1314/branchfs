@@ -27,11 +27,6 @@ pub(crate) fn classify_path(path: &str) -> PathContext {
             let branch = &rest[..slash_pos];
             let remainder = &rest[slash_pos..]; // e.g. "/.branchfs_ctl" or "/src/main.rs"
 
-            // Handle nested @child: /@parent/@child/... → recurse as /@child/...
-            if remainder.starts_with("/@") {
-                return classify_path(remainder);
-            }
-
             if remainder == format!("/{}", CTL_FILE).as_str() {
                 PathContext::BranchCtl(branch.to_string())
             } else {

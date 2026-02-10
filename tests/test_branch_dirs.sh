@@ -170,17 +170,17 @@ test_branch_dir_nested_child() {
     do_create "parent-br" "main"
     do_create "child-br" "parent-br"
 
-    # @child-br should appear as a top-level @branch dir
+    # @child-br should appear as a top-level @branch dir (flat namespace)
     assert "[[ -d '$TEST_MNT/@child-br' ]]" "@child-br exists at top level"
 
-    # @child-br should also appear nested under @parent-br
-    assert "[[ -d '$TEST_MNT/@parent-br/@child-br' ]]" "@child-br nested under @parent-br"
+    # Nested /@parent-br/@child-br should NOT exist (pure flat)
+    assert "[[ ! -d '$TEST_MNT/@parent-br/@child-br' ]]" "@child-br NOT nested under @parent-br"
 
-    # Write to child branch, verify visible both ways
+    # Write to child branch, verify visible via flat path
     echo "child content" > "$TEST_MNT/@child-br/child_file.txt"
     assert_file_exists "$TEST_MNT/@child-br/child_file.txt" "child_file.txt via @child-br"
 
-    # Child branch should also see parent's files
+    # Child branch should see parent's files (inheritance via resolve_path chain)
     echo "parent content" > "$TEST_MNT/@parent-br/parent_file.txt"
 
     # Switch root to main so we don't confuse things
