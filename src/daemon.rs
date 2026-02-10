@@ -32,10 +32,6 @@ pub enum Request {
         name: String,
         parent: String,
     },
-    NotifySwitch {
-        mountpoint: String,
-        branch: String,
-    },
     GetMountBranch {
         mountpoint: String,
     },
@@ -78,10 +74,10 @@ impl Response {
     }
 }
 
-/// Per-mount state including the FUSE session and current branch
+/// Per-mount state (FUSE session handle — kept alive until unmount)
 pub struct MountInfo {
+    #[allow(dead_code)]
     session: BackgroundSession,
-    current_branch: String,
 }
 
 pub struct Daemon {
@@ -145,7 +141,10 @@ impl Daemon {
         mountpoint: &Path,
         passthrough: bool,
     ) -> Result<()> {
-        let fs = BranchFs::new(self.manager.clone(), branch_name.to_string(), passthrough);
+        // Register the mount branch *before* creating BranchFs so get_branch_name() works
+        self.manager.set_mount_branch(mountpoint, branch_name);
+
+        let fs = BranchFs::new(self.manager.clone(), mountpoint.to_path_buf(), passthrough);
         let options = vec![
             MountOption::FSName("branchfs".to_string()),
             MountOption::DefaultPermissions,
@@ -157,18 +156,21 @@ impl Daemon {
             mountpoint,
         );
 
-        let session =
-            fuser::spawn_mount2(fs, mountpoint, &options).map_err(crate::error::BranchError::Io)?;
+        let session = match fuser::spawn_mount2(fs, mountpoint, &options) {
+            Ok(s) => s,
+            Err(e) => {
+                // Clean up on failure
+                self.manager.unregister_mount(mountpoint);
+                return Err(crate::error::BranchError::Io(e));
+            }
+        };
 
         // Get the notifier for cache invalidation and register it with the manager
         let notifier = Arc::new(session.notifier());
         self.manager
             .register_notifier(branch_name, mountpoint.to_path_buf(), notifier);
 
-        let mount_info = MountInfo {
-            session,
-            current_branch: branch_name.to_string(),
-        };
+        let mount_info = MountInfo { session };
 
         self.mounts
             .lock()
@@ -178,12 +180,12 @@ impl Daemon {
     }
 
     pub fn unmount(&self, mountpoint: &Path) -> Result<()> {
-        let (should_shutdown, mount_info) = {
+        let should_shutdown = {
             let mut mounts = self.mounts.lock();
-            if let Some(info) = mounts.remove(mountpoint) {
+            if mounts.remove(mountpoint).is_some() {
                 log::info!("Unmounted {:?}", mountpoint);
                 // The BackgroundSession drop will handle FUSE cleanup
-                (mounts.is_empty(), Some(info))
+                mounts.is_empty()
             } else {
                 return Err(crate::error::BranchError::MountNotFound(format!(
                     "{:?}",
@@ -192,10 +194,7 @@ impl Daemon {
             }
         };
 
-        if let Some(info) = mount_info {
-            self.manager
-                .unregister_notifier(&info.current_branch, mountpoint);
-        }
+        self.manager.unregister_mount(mountpoint);
 
         if should_shutdown {
             log::info!("All mounts removed, daemon will exit");
@@ -209,9 +208,8 @@ impl Daemon {
         let mut mounts = self.mounts.lock();
         let mountpoints: Vec<PathBuf> = mounts.keys().cloned().collect();
         for mountpoint in &mountpoints {
-            if let Some(info) = mounts.remove(mountpoint) {
-                self.manager
-                    .unregister_notifier(&info.current_branch, mountpoint);
+            if mounts.remove(mountpoint).is_some() {
+                self.manager.unregister_mount(mountpoint);
                 // BackgroundSession dropped here → FUSE unmount
                 log::info!("Cleaned up mount at {:?}", mountpoint);
             }
@@ -329,35 +327,10 @@ impl Daemon {
                 Ok(()) => Response::success(),
                 Err(e) => Response::error(&format!("{}", e)),
             },
-            Request::NotifySwitch { mountpoint, branch } => {
-                let path = PathBuf::from(&mountpoint);
-                let mut mounts = self.mounts.lock();
-                if let Some(ref mut info) = mounts.get_mut(&path) {
-                    // Unregister old notifier
-                    self.manager
-                        .unregister_notifier(&info.current_branch, &path);
-                    // Update tracked branch
-                    let old_branch = std::mem::replace(&mut info.current_branch, branch.clone());
-                    // Register notifier for new branch
-                    let notifier = Arc::new(info.session.notifier());
-                    self.manager
-                        .register_notifier(&branch, path.clone(), notifier);
-                    log::info!(
-                        "Mount {:?} switched from '{}' to '{}'",
-                        path,
-                        old_branch,
-                        branch
-                    );
-                    Response::success()
-                } else {
-                    Response::error(&format!("Mount not found: {:?}", path))
-                }
-            }
             Request::GetMountBranch { mountpoint } => {
                 let path = PathBuf::from(&mountpoint);
-                let mounts = self.mounts.lock();
-                if let Some(info) = mounts.get(&path) {
-                    Response::success_with_data(serde_json::json!(info.current_branch))
+                if let Some(branch) = self.manager.get_mount_branch(&path) {
+                    Response::success_with_data(serde_json::json!(branch))
                 } else {
                     Response::error(&format!("Mount not found: {:?}", path))
                 }

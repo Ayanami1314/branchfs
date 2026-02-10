@@ -88,7 +88,8 @@ impl BranchFs {
                 // Only switch the mount if the operated branch is the current mount branch
                 let current = self.get_branch_name();
                 if current == branch {
-                    *self.branch_name.write() = parent.clone();
+                    self.manager
+                        .switch_mount_branch(&self.mountpoint, &parent);
                     log::info!(
                         "Branch ctl {} succeeded for '{}', switched to '{}'",
                         cmd_lower,

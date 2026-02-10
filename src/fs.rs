@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read as IoRead, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -132,7 +132,7 @@ impl WriteFileCache {
 pub struct BranchFs {
     pub(crate) manager: Arc<BranchManager>,
     pub(crate) inodes: InodeManager,
-    pub(crate) branch_name: RwLock<String>,
+    pub(crate) mountpoint: PathBuf,
     pub(crate) current_epoch: AtomicU64,
     /// Per-branch ctl inode numbers: branch_name → ino
     pub(crate) branch_ctl_inodes: RwLock<HashMap<String, u64>>,
@@ -154,12 +154,12 @@ pub struct BranchFs {
 }
 
 impl BranchFs {
-    pub fn new(manager: Arc<BranchManager>, branch_name: String, passthrough: bool) -> Self {
+    pub fn new(manager: Arc<BranchManager>, mountpoint: PathBuf, passthrough: bool) -> Self {
         let current_epoch = manager.get_epoch();
         Self {
             manager,
             inodes: InodeManager::new(),
-            branch_name: RwLock::new(branch_name),
+            mountpoint,
             current_epoch: AtomicU64::new(current_epoch),
             branch_ctl_inodes: RwLock::new(HashMap::new()),
             // Reserve a range well below CTL_INO (u64::MAX - 1) for branch ctl inodes.
@@ -176,7 +176,9 @@ impl BranchFs {
     }
 
     pub(crate) fn get_branch_name(&self) -> String {
-        self.branch_name.read().clone()
+        self.manager
+            .get_mount_branch(&self.mountpoint)
+            .unwrap_or_else(|| "main".into())
     }
 
     pub(crate) fn is_stale(&self) -> bool {
@@ -185,9 +187,10 @@ impl BranchFs {
             || !self.manager.is_branch_valid(&branch_name)
     }
 
-    /// Switch to a different branch (used after commit/abort to switch to main)
+    /// Switch to a different branch (used after commit/abort to switch to parent)
     pub(crate) fn switch_to_branch(&self, new_branch: &str) {
-        *self.branch_name.write() = new_branch.to_string();
+        self.manager
+            .switch_mount_branch(&self.mountpoint, new_branch);
         self.current_epoch
             .store(self.manager.get_epoch(), Ordering::SeqCst);
         // Clear inode cache since we're on a different branch now
