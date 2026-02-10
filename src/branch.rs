@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -18,10 +18,19 @@ pub struct Branch {
     pub files_dir: PathBuf,
     pub tombstones_file: PathBuf,
     tombstones: RwLock<HashSet<String>>,
+    /// How many children have been committed (merged) into this branch.
+    pub commit_count: AtomicU64,
+    /// Parent's commit_count at the time this branch was forked.
+    pub parent_version_at_fork: u64,
 }
 
 impl Branch {
-    pub fn new(name: &str, parent: Option<&str>, storage_path: &Path) -> Result<Self> {
+    pub fn new(
+        name: &str,
+        parent: Option<&str>,
+        storage_path: &Path,
+        parent_version_at_fork: u64,
+    ) -> Result<Self> {
         let branch_dir = storage_path.join("branches").join(name);
         let files_dir = branch_dir.join("files");
         let tombstones_file = branch_dir.join("tombstones");
@@ -39,6 +48,8 @@ impl Branch {
             files_dir,
             tombstones_file,
             tombstones: RwLock::new(tombstones),
+            commit_count: AtomicU64::new(0),
+            parent_version_at_fork,
         })
     }
 
@@ -129,14 +140,16 @@ pub struct BranchManager {
     pub storage_path: PathBuf,
     pub base_path: PathBuf,
     pub workspace_path: PathBuf,
-    branches: RwLock<std::collections::HashMap<String, Branch>>,
+    branches: RwLock<HashMap<String, Branch>>,
     pub epoch: AtomicU64,
     /// Notifiers for invalidating kernel cache on commit/abort
     /// Maps (branch_name, mountpoint) -> Notifier
-    notifiers: Mutex<std::collections::HashMap<(String, PathBuf), Arc<Notifier>>>,
+    notifiers: Mutex<HashMap<(String, PathBuf), Arc<Notifier>>>,
     /// Track opened file inodes per branch for cache invalidation
     /// Maps branch_name -> Set of inodes
-    opened_inodes: Mutex<std::collections::HashMap<String, HashSet<u64>>>,
+    opened_inodes: Mutex<HashMap<String, HashSet<u64>>>,
+    /// Current branch per mount — single source of truth
+    mount_branches: RwLock<HashMap<PathBuf, String>>,
 }
 
 impl BranchManager {
@@ -144,8 +157,8 @@ impl BranchManager {
         fs::create_dir_all(&storage_path)?;
 
         // Always start fresh with just the "main" branch
-        let mut branches = std::collections::HashMap::new();
-        let main_branch = Branch::new("main", None, &storage_path)?;
+        let mut branches = HashMap::new();
+        let main_branch = Branch::new("main", None, &storage_path, 0)?;
         branches.insert("main".to_string(), main_branch);
 
         Ok(Self {
@@ -154,9 +167,54 @@ impl BranchManager {
             workspace_path,
             branches: RwLock::new(branches),
             epoch: AtomicU64::new(0),
-            notifiers: Mutex::new(std::collections::HashMap::new()),
-            opened_inodes: Mutex::new(std::collections::HashMap::new()),
+            notifiers: Mutex::new(HashMap::new()),
+            opened_inodes: Mutex::new(HashMap::new()),
+            mount_branches: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Register a mount's initial branch (called before FUSE spawn).
+    pub fn set_mount_branch(&self, mountpoint: &Path, branch: &str) {
+        self.mount_branches
+            .write()
+            .insert(mountpoint.to_path_buf(), branch.to_string());
+    }
+
+    /// Read the current branch for a mount.
+    pub fn get_mount_branch(&self, mountpoint: &Path) -> Option<String> {
+        self.mount_branches.read().get(mountpoint).cloned()
+    }
+
+    /// Atomically switch a mount's branch, re-keying the notifier map.
+    pub fn switch_mount_branch(&self, mountpoint: &Path, new_branch: &str) {
+        // Lock order: mount_branches → notifiers (never reversed)
+        let mut mb = self.mount_branches.write();
+        let old_branch = mb.insert(mountpoint.to_path_buf(), new_branch.to_string());
+
+        // Re-key notifier from (old, mount) → (new, mount)
+        if let Some(old) = old_branch {
+            let mut notifiers = self.notifiers.lock();
+            if let Some(notifier) = notifiers.remove(&(old.clone(), mountpoint.to_path_buf())) {
+                notifiers.insert((new_branch.to_string(), mountpoint.to_path_buf()), notifier);
+            }
+            log::info!(
+                "switch_mount_branch: {:?} '{}' -> '{}'",
+                mountpoint,
+                old,
+                new_branch
+            );
+        }
+    }
+
+    /// Remove a mount's branch tracking and notifier (used on unmount).
+    pub fn unregister_mount(&self, mountpoint: &Path) {
+        let mut mb = self.mount_branches.write();
+        let old_branch = mb.remove(mountpoint);
+        if let Some(old) = old_branch {
+            self.notifiers
+                .lock()
+                .remove(&(old, mountpoint.to_path_buf()));
+        }
     }
 
     pub fn create_branch(&self, name: &str, parent: &str) -> Result<()> {
@@ -169,11 +227,12 @@ impl BranchManager {
             return Err(BranchError::AlreadyExists(name.to_string()));
         }
 
-        if !branches.contains_key(parent) {
-            return Err(BranchError::ParentNotFound(parent.to_string()));
-        }
+        let parent_branch = branches
+            .get(parent)
+            .ok_or_else(|| BranchError::ParentNotFound(parent.to_string()))?;
+        let parent_version = parent_branch.commit_count.load(Ordering::SeqCst);
 
-        let branch = Branch::new(name, Some(parent), &self.storage_path)?;
+        let branch = Branch::new(name, Some(parent), &self.storage_path, parent_version)?;
         branches.insert(name.to_string(), branch);
 
         let elapsed = start.elapsed();
@@ -336,16 +395,6 @@ impl BranchManager {
         }
     }
 
-    /// Return the names of branches whose parent is `parent_name`.
-    pub fn get_children(&self, parent_name: &str) -> Vec<String> {
-        self.branches
-            .read()
-            .values()
-            .filter(|b| b.parent.as_deref() == Some(parent_name))
-            .map(|b| b.name.clone())
-            .collect()
-    }
-
     pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
         let branches = self.branches.read();
 
@@ -405,6 +454,20 @@ impl BranchManager {
             .clone()
             .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
+        let child_version_at_fork = branch.parent_version_at_fork;
+
+        // First-wins conflict detection: check that the parent hasn't had
+        // another sibling committed since this branch was forked.
+        {
+            let parent = branches
+                .get(&parent_name)
+                .ok_or_else(|| BranchError::NotFound(parent_name.to_string()))?;
+            let current_parent_version = parent.commit_count.load(Ordering::SeqCst);
+            if current_parent_version != child_version_at_fork {
+                return Err(BranchError::Conflict(branch_name.to_string()));
+            }
+        }
+
         let child_tombstones = branch.get_tombstones();
         let child_files_dir = branch.files_dir.clone();
 
@@ -436,6 +499,11 @@ impl BranchManager {
                 let _ = fs::copy(src_path, &dest);
                 num_files += 1;
             })?;
+
+            // Increment parent's commit_count (first-wins bookkeeping)
+            if let Some(main_branch) = branches.get("main") {
+                main_branch.commit_count.fetch_add(1, Ordering::SeqCst);
+            }
 
             // Remove branch
             branches.remove(branch_name);
@@ -500,6 +568,9 @@ impl BranchManager {
 
             // Write updated tombstones to parent
             parent.set_tombstones(parent_tombstones)?;
+
+            // Increment parent's commit_count (first-wins bookkeeping)
+            parent.commit_count.fetch_add(1, Ordering::SeqCst);
 
             // Remove child branch
             branches.remove(branch_name);

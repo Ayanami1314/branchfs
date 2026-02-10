@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read as IoRead, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,6 +14,7 @@ use fuser::{
 use parking_lot::RwLock;
 
 use crate::branch::BranchManager;
+use crate::error::BranchError;
 use crate::fs_path::{classify_path, PathContext};
 use crate::inode::{InodeManager, ROOT_INO};
 use crate::storage;
@@ -24,9 +25,9 @@ use crate::storage;
 pub(crate) const TTL: Duration = Duration::from_secs(0);
 pub(crate) const BLOCK_SIZE: u32 = 512;
 
-pub const FS_IOC_BRANCH_CREATE: u32 = 0x6200; // _IO('b', 0)
-pub const FS_IOC_BRANCH_COMMIT: u32 = 0x6201; // _IO('b', 1)
-pub const FS_IOC_BRANCH_ABORT: u32 = 0x6202; // _IO('b', 2)
+pub const FS_IOC_BRANCH_CREATE: u32 = 0x8080_6200; // _IOR('b', 0, [u8; 128])
+pub const FS_IOC_BRANCH_COMMIT: u32 = 0x0000_6201; // _IO ('b', 1)
+pub const FS_IOC_BRANCH_ABORT: u32 = 0x0000_6202; // _IO ('b', 2)
 
 pub(crate) const CTL_FILE: &str = ".branchfs_ctl";
 pub(crate) const CTL_INO: u64 = u64::MAX - 1;
@@ -116,7 +117,7 @@ impl WriteFileCache {
 pub struct BranchFs {
     pub(crate) manager: Arc<BranchManager>,
     pub(crate) inodes: InodeManager,
-    pub(crate) branch_name: RwLock<String>,
+    pub(crate) mountpoint: PathBuf,
     pub(crate) current_epoch: AtomicU64,
     /// Per-branch ctl inode numbers: branch_name → ino
     pub(crate) branch_ctl_inodes: RwLock<HashMap<String, u64>>,
@@ -138,12 +139,12 @@ pub struct BranchFs {
 }
 
 impl BranchFs {
-    pub fn new(manager: Arc<BranchManager>, branch_name: String, passthrough: bool) -> Self {
+    pub fn new(manager: Arc<BranchManager>, mountpoint: PathBuf, passthrough: bool) -> Self {
         let current_epoch = manager.get_epoch();
         Self {
             manager,
             inodes: InodeManager::new(),
-            branch_name: RwLock::new(branch_name),
+            mountpoint,
             current_epoch: AtomicU64::new(current_epoch),
             branch_ctl_inodes: RwLock::new(HashMap::new()),
             // Reserve a range well below CTL_INO (u64::MAX - 1) for branch ctl inodes.
@@ -160,7 +161,9 @@ impl BranchFs {
     }
 
     pub(crate) fn get_branch_name(&self) -> String {
-        self.branch_name.read().clone()
+        self.manager
+            .get_mount_branch(&self.mountpoint)
+            .unwrap_or_else(|| "main".into())
     }
 
     pub(crate) fn is_stale(&self) -> bool {
@@ -169,9 +172,10 @@ impl BranchFs {
             || !self.manager.is_branch_valid(&branch_name)
     }
 
-    /// Switch to a different branch (used after commit/abort to switch to main)
+    /// Switch to a different branch (used after commit/abort to switch to parent)
     pub(crate) fn switch_to_branch(&self, new_branch: &str) {
-        *self.branch_name.write() = new_branch.to_string();
+        self.manager
+            .switch_mount_branch(&self.mountpoint, new_branch);
         self.current_epoch
             .store(self.manager.get_epoch(), Ordering::SeqCst);
         // Clear inode cache since we're on a different branch now
@@ -397,16 +401,9 @@ impl Filesystem for BranchFs {
                 return;
             }
 
-            // Looking up @child inside a branch dir (nested branch)
-            if let Some(child_branch) = name_str.strip_prefix('@') {
-                let children = self.manager.get_children(&branch);
-                if parent_rel == "/" && children.iter().any(|c| c == child_branch) {
-                    let inode_path = format!("/@{}/@{}", branch, child_branch);
-                    let ino = self.inodes.get_or_create(&inode_path, true);
-                    reply.entry(&TTL, &self.synthetic_dir_attr(ino), 0);
-                } else {
-                    reply.error(libc::ENOENT);
-                }
+            // @-prefixed names inside branch dirs are not valid (flat namespace)
+            if name_str.starts_with('@') {
+                reply.error(libc::ENOENT);
                 return;
             }
 
@@ -560,6 +557,20 @@ impl Filesystem for BranchFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
+        // Reading root ctl file returns the current branch name
+        if ino == CTL_INO {
+            let branch = self.get_branch_name();
+            let bytes = branch.as_bytes();
+            let off = offset as usize;
+            if off >= bytes.len() {
+                reply.data(&[]);
+            } else {
+                let end = (off + size as usize).min(bytes.len());
+                reply.data(&bytes[off..end]);
+            }
+            return;
+        }
+
         let epoch = self.current_epoch.load(Ordering::SeqCst);
 
         // Fast path: reuse cached fd for the same inode+epoch (avoids
@@ -814,14 +825,6 @@ impl Filesystem for BranchFs {
                 // Add .branchfs_ctl
                 let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
                 entries.push((ctl_ino, FileType::RegularFile, CTL_FILE.to_string()));
-
-                // Add @child virtual dirs for children of this branch
-                let children = self.manager.get_children(&branch);
-                for child in children {
-                    let child_inode_path = format!("/@{}/@{}", branch, child);
-                    let child_ino = self.inodes.get_or_create(&child_inode_path, true);
-                    entries.push((child_ino, FileType::Directory, format!("@{}", child)));
-                }
 
                 for (i, (e_ino, kind, name)) in
                     entries.into_iter().enumerate().skip(offset as usize)
@@ -1331,7 +1334,7 @@ impl Filesystem for BranchFs {
     fn ioctl(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _flags: u32,
         cmd: u32,
@@ -1339,19 +1342,30 @@ impl Filesystem for BranchFs {
         _out_size: u32,
         reply: ReplyIoctl,
     ) {
-        let branch_name = self.get_branch_name();
+        // Resolve ino to the branch name this ctl fd refers to.
+        let branch_name = if ino == CTL_INO {
+            self.get_branch_name()
+        } else if let Some(name) = self.branch_for_ctl_ino(ino) {
+            name
+        } else {
+            reply.error(libc::ENOTTY);
+            return;
+        };
+
         match cmd {
             FS_IOC_BRANCH_CREATE => {
                 let name = format!("branch-{}", uuid::Uuid::new_v4());
                 log::info!("ioctl: CREATE branch '{}' from '{}'", name, branch_name);
                 match self.manager.create_branch(&name, &branch_name) {
                     Ok(()) => {
-                        self.switch_to_branch(&name);
-                        log::info!("Switched to new branch '{}'", name);
-                        // _IO encoding has no data direction, so we cannot
-                        // return data through restricted FUSE ioctl.  The
-                        // mount is already switched to the new branch.
-                        reply.ioctl(0, &[])
+                        self.current_epoch
+                            .store(self.manager.get_epoch(), Ordering::SeqCst);
+                        log::info!("Created branch '{}' (no mount switch)", name);
+                        let mut buf = [0u8; 128];
+                        let name_bytes = name.as_bytes();
+                        let len = name_bytes.len().min(127);
+                        buf[..len].copy_from_slice(&name_bytes[..len]);
+                        reply.ioctl(0, &buf)
                     }
                     Err(e) => {
                         log::error!("create branch failed: {}", e);
@@ -1360,12 +1374,18 @@ impl Filesystem for BranchFs {
                 }
             }
             FS_IOC_BRANCH_COMMIT => {
-                log::info!("ioctl: COMMIT for branch '{}'", branch_name);
+                log::info!("ioctl: COMMIT branch '{}'", branch_name);
                 match self.manager.commit(&branch_name) {
-                    Ok(parent) => {
-                        self.switch_to_branch(&parent);
-                        log::info!("Switched to branch '{}' after commit", parent);
+                    Ok(_parent) => {
+                        self.inodes.clear_prefix(&format!("/@{}", branch_name));
+                        self.current_epoch
+                            .store(self.manager.get_epoch(), Ordering::SeqCst);
+                        log::info!("Committed branch '{}' (no mount switch)", branch_name);
                         reply.ioctl(0, &[])
+                    }
+                    Err(BranchError::Conflict(_)) => {
+                        log::warn!("commit conflict for branch '{}'", branch_name);
+                        reply.error(libc::ESTALE);
                     }
                     Err(e) => {
                         log::error!("commit failed: {}", e);
@@ -1374,11 +1394,13 @@ impl Filesystem for BranchFs {
                 }
             }
             FS_IOC_BRANCH_ABORT => {
-                log::info!("ioctl: ABORT for branch '{}'", branch_name);
+                log::info!("ioctl: ABORT branch '{}'", branch_name);
                 match self.manager.abort(&branch_name) {
-                    Ok(parent) => {
-                        self.switch_to_branch(&parent);
-                        log::info!("Switched to branch '{}' after abort", parent);
+                    Ok(_parent) => {
+                        self.inodes.clear_prefix(&format!("/@{}", branch_name));
+                        self.current_epoch
+                            .store(self.manager.get_epoch(), Ordering::SeqCst);
+                        log::info!("Aborted branch '{}' (no mount switch)", branch_name);
                         reply.ioctl(0, &[])
                     }
                     Err(e) => {

@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use fuser::ReplyWrite;
 
+use crate::error::BranchError;
 use crate::fs::BranchFs;
 
 impl BranchFs {
@@ -34,15 +35,15 @@ impl BranchFs {
     }
 
     /// Handle a write to the root ctl file.
+    /// Only supports `switch:<branch_name>` — commit/abort go through
+    /// per-branch ctl files (`/@<branch>/.branchfs_ctl`).
     pub(crate) fn handle_root_ctl_write(&mut self, data: &[u8], reply: ReplyWrite) {
         let cmd = String::from_utf8_lossy(data).trim().to_string();
         let cmd_lower = cmd.to_lowercase();
-        let branch_name = self.get_branch_name();
-        log::info!("Control command: '{}' for branch '{}'", cmd, branch_name);
+        log::info!("Root ctl command: '{}'", cmd);
 
-        // Handle switch command: "switch:branchname"
-        if cmd_lower.starts_with("switch:") {
-            let new_branch = cmd[7..].trim();
+        if let Some(new_branch) = cmd_lower.strip_prefix("switch:") {
+            let new_branch = new_branch.trim();
             if new_branch.is_empty() {
                 log::warn!("Empty branch name in switch command");
                 reply.error(libc::EINVAL);
@@ -56,29 +57,12 @@ impl BranchFs {
             self.switch_to_branch(new_branch);
             log::info!("Switched to branch '{}'", new_branch);
             reply.written(data.len() as u32);
-            return;
-        }
-
-        let result = match cmd_lower.as_str() {
-            "commit" => self.manager.commit(&branch_name),
-            "abort" => self.manager.abort(&branch_name),
-            _ => {
-                log::warn!("Unknown control command: {}", cmd);
-                reply.error(libc::EINVAL);
-                return;
-            }
-        };
-
-        match result {
-            Ok(parent) => {
-                self.switch_to_branch(&parent);
-                log::info!("Switched to branch '{}' after {}", parent, cmd_lower);
-                reply.written(data.len() as u32)
-            }
-            Err(e) => {
-                log::error!("Control command failed: {}", e);
-                reply.error(libc::EIO);
-            }
+        } else {
+            log::warn!(
+                "Unknown root ctl command: '{}' (use /@branch/.branchfs_ctl for commit/abort)",
+                cmd
+            );
+            reply.error(libc::EINVAL);
         }
     }
 
@@ -104,14 +88,29 @@ impl BranchFs {
                 self.inodes.clear_prefix(&format!("/@{}", branch));
                 self.current_epoch
                     .store(self.manager.get_epoch(), Ordering::SeqCst);
-                *self.branch_name.write() = parent.clone();
-                log::info!(
-                    "Branch ctl {} succeeded for '{}', switched to '{}'",
-                    cmd_lower,
-                    branch,
-                    parent
-                );
+                // Only switch the mount if the operated branch is the current mount branch
+                let current = self.get_branch_name();
+                if current == branch {
+                    self.manager.switch_mount_branch(&self.mountpoint, &parent);
+                    log::info!(
+                        "Branch ctl {} succeeded for '{}', switched to '{}'",
+                        cmd_lower,
+                        branch,
+                        parent
+                    );
+                } else {
+                    log::info!(
+                        "Branch ctl {} succeeded for '{}' (mount stays on '{}')",
+                        cmd_lower,
+                        branch,
+                        current
+                    );
+                }
                 reply.written(data.len() as u32)
+            }
+            Err(BranchError::Conflict(_)) => {
+                log::warn!("Branch ctl {} conflict for '{}'", cmd_lower, branch);
+                reply.error(libc::ESTALE);
             }
             Err(e) => {
                 log::error!("Branch ctl command failed: {}", e);

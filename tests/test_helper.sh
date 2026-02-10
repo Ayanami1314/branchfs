@@ -125,10 +125,22 @@ do_abort() {
     "$BRANCHFS" abort "$TEST_MNT" --storage "$TEST_STORAGE"
 }
 
-# Switch to a branch by writing to the ctl file
+# Switch to a branch by writing to the ctl file and notifying daemon
 do_switch() {
     local name="$1"
     echo -n "switch:${name}" > "$TEST_MNT/.branchfs_ctl"
+    # Notify daemon of the switch so get_mount_branch() returns correct data
+    local canon_mnt
+    canon_mnt="$(readlink -f "$TEST_MNT")"
+    python3 -c "
+import socket, json, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+msg = json.dumps({'cmd': 'notify_switch', 'mountpoint': sys.argv[2], 'branch': sys.argv[3]}) + chr(10)
+s.sendall(msg.encode())
+s.recv(4096)
+s.close()
+" "$TEST_STORAGE/daemon.sock" "$canon_mnt" "$name" 2>/dev/null || true
 }
 
 # List branches
