@@ -28,18 +28,8 @@ TEST_MNT="/tmp/branchfs_test_mnt_$TEST_ID"
 # Track if we've set up
 SETUP_DONE=0
 
-# Build the project if needed
-build_if_needed() {
-    if [[ ! -x "$BRANCHFS" ]]; then
-        echo -e "${YELLOW}Building branchfs...${NC}"
-        (cd "$PROJECT_ROOT" && cargo build --release)
-    fi
-}
-
 # Set up test environment
 setup() {
-    build_if_needed
-
     # Create test directories
     mkdir -p "$TEST_BASE"
     mkdir -p "$TEST_STORAGE"

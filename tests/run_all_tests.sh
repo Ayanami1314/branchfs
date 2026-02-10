@@ -35,14 +35,12 @@ if [[ ! -r /dev/fuse ]] || [[ ! -w /dev/fuse ]]; then
 fi
 echo "  ✓ /dev/fuse accessible"
 
-# Build if needed
-echo ""
-echo -e "${YELLOW}Building branchfs...${NC}"
-(cd "$PROJECT_ROOT" && cargo build --release 2>&1) || {
-    echo -e "${RED}Build failed${NC}"
+# Check binary exists
+if [[ ! -x "$PROJECT_ROOT/target/release/branchfs" ]]; then
+    echo -e "${RED}Error: target/release/branchfs not found. Run 'cargo build --release' first.${NC}"
     exit 1
-}
-echo -e "${GREEN}  ✓ Build successful${NC}"
+fi
+echo "  ✓ branchfs binary found"
 
 # Run tests
 echo ""
@@ -82,6 +80,21 @@ for test_file in "$SCRIPT_DIR"/test_*.sh; do
         run_test_suite "$test_file"
     fi
 done
+
+# Run ioctl integration tests
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  test_ioctl (Rust integration)${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+if (cd "$PROJECT_ROOT" && cargo test --test test_ioctl -- --ignored 2>&1); then
+    PASSED_SUITES=$((PASSED_SUITES + 1))
+    echo -e "${GREEN}Suite test_ioctl: PASSED${NC}"
+else
+    FAILED_SUITES=$((FAILED_SUITES + 1))
+    FAILED_SUITE_NAMES+=("test_ioctl")
+    echo -e "${RED}Suite test_ioctl: FAILED${NC}"
+fi
+echo ""
 
 # Final summary
 echo -e "${BLUE}========================================${NC}"
