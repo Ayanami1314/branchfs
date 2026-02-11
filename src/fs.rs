@@ -1121,6 +1121,179 @@ impl Filesystem for BranchFs {
         self.unlink(_req, parent, name, reply);
     }
 
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
+        let parent_path = match self.inodes.get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let newparent_path = match self.inodes.get_path(newparent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let name_str = name.to_string_lossy();
+        let newname_str = newname.to_string_lossy();
+
+        // Normalize both parents to (branch, parent_rel, inode_prefix, is_root_path).
+        let resolve_parent = |path: &str| -> Option<(String, String, String, bool)> {
+            match classify_path(path) {
+                PathContext::BranchDir(b) => {
+                    Some((b.clone(), "/".into(), format!("/@{}", b), false))
+                }
+                PathContext::BranchPath(b, rel) => {
+                    Some((b.clone(), rel, format!("/@{}", b), false))
+                }
+                PathContext::RootPath(rp) => Some((String::new(), rp, String::new(), true)),
+                _ => None,
+            }
+        };
+
+        let (src_branch, src_parent_rel, src_prefix, src_is_root) =
+            match resolve_parent(&parent_path) {
+                Some(t) => t,
+                None => {
+                    reply.error(libc::EPERM);
+                    return;
+                }
+            };
+        let (dst_branch, dst_parent_rel, dst_prefix, dst_is_root) =
+            match resolve_parent(&newparent_path) {
+                Some(t) => t,
+                None => {
+                    reply.error(libc::EPERM);
+                    return;
+                }
+            };
+
+        // Both must be the same kind (both root or both same branch)
+        if src_is_root != dst_is_root || (!src_is_root && src_branch != dst_branch) {
+            reply.error(libc::EXDEV);
+            return;
+        }
+
+        let branch = if src_is_root {
+            self.get_branch_name()
+        } else {
+            if !self.manager.is_branch_valid(&src_branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            src_branch
+        };
+
+        let join_rel = |parent_rel: &str, child: &str| -> String {
+            if parent_rel == "/" {
+                format!("/{}", child)
+            } else {
+                format!("{}/{}", parent_rel, child)
+            }
+        };
+        let src_rel = join_rel(&src_parent_rel, &name_str);
+        let dst_rel = join_rel(&dst_parent_rel, &newname_str);
+
+        // Check source exists
+        if self.resolve_for_branch(&branch, &src_rel).is_none() {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        // RENAME_NOREPLACE
+        if flags & libc::RENAME_NOREPLACE != 0
+            && self.resolve_for_branch(&branch, &dst_rel).is_some()
+        {
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        // COW source into delta
+        let src_delta = match self.ensure_cow_for_branch(&branch, &src_rel) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
+
+        let dst_delta = self.get_delta_path_for_branch(&branch, &dst_rel);
+        if storage::ensure_parent_dirs(&dst_delta).is_err() {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        // If destination already exists, remove its delta so rename can overwrite
+        let dst_existed = self.resolve_for_branch(&branch, &dst_rel).is_some();
+        if dst_existed {
+            let _ = self.manager.with_branch(&branch, |b| {
+                let d = b.delta_path(&dst_rel);
+                if d.exists() {
+                    if d.is_dir() {
+                        let _ = std::fs::remove_dir_all(&d);
+                    } else {
+                        let _ = std::fs::remove_file(&d);
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        // Move within the delta layer (same filesystem, always succeeds)
+        if std::fs::rename(&src_delta, &dst_delta).is_err() {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        // Update tombstones: mark src deleted, revive dst, tombstone old dst
+        let result = self.manager.with_branch(&branch, |b| {
+            b.add_tombstone(&src_rel)?;
+            if dst_existed {
+                b.add_tombstone(&dst_rel)?;
+            }
+            b.remove_tombstone(&dst_rel);
+            Ok(())
+        });
+        if result.is_err() {
+            reply.error(libc::EIO);
+            return;
+        }
+
+        if src_is_root && self.is_stale() {
+            reply.error(libc::ESTALE);
+            return;
+        }
+
+        // Update inode cache
+        let src_inode_path = format!("{}{}", src_prefix, src_rel);
+        let dst_inode_path = format!("{}{}", dst_prefix, dst_rel);
+        let is_dir = dst_delta.is_dir();
+        self.inodes.remove(&src_inode_path);
+        self.inodes.remove(&dst_inode_path);
+        let new_ino = self.inodes.get_or_create(&dst_inode_path, is_dir);
+        self.open_cache.invalidate_ino(new_ino);
+        self.write_cache.invalidate_ino(new_ino);
+
+        reply.ok();
+    }
+
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         // Control file is always openable (no epoch check)
         if ino == CTL_INO {
