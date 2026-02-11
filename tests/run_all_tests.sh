@@ -96,6 +96,21 @@ else
 fi
 echo ""
 
+# Run filesystem integration tests
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  test_integration (Rust integration)${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+TOTAL_TESTS=$((TOTAL_TESTS + 1))
+if (cd "$PROJECT_ROOT" && cargo test --test test_integration -- --ignored 2>&1); then
+    PASSED_SUITES=$((PASSED_SUITES + 1))
+    echo -e "${GREEN}Suite test_integration: PASSED${NC}"
+else
+    FAILED_SUITES=$((FAILED_SUITES + 1))
+    FAILED_SUITE_NAMES+=("test_integration")
+    echo -e "${RED}Suite test_integration: FAILED${NC}"
+fi
+echo ""
+
 # Final summary
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}       Final Summary${NC}"
