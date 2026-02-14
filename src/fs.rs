@@ -377,7 +377,10 @@ impl Filesystem for BranchFs {
                     return;
                 }
             };
-            let is_dir = resolved.is_dir();
+            let is_dir = resolved
+                .symlink_metadata()
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
             let ino = self.inodes.get_or_create(&path, is_dir);
             match self.make_attr(ino, &resolved) {
                 Some(attr) => reply.entry(&TTL, &attr, 0),
@@ -428,7 +431,10 @@ impl Filesystem for BranchFs {
             };
 
             let inode_path = format!("/@{}{}", branch, child_rel);
-            let is_dir = resolved.is_dir();
+            let is_dir = resolved
+                .symlink_metadata()
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
             let ino = self.inodes.get_or_create(&inode_path, is_dir);
             match self.make_attr(ino, &resolved) {
                 Some(attr) => reply.entry(&TTL, &attr, 0),
@@ -449,7 +455,10 @@ impl Filesystem for BranchFs {
                     return;
                 }
             };
-            let is_dir = resolved.is_dir();
+            let is_dir = resolved
+                .symlink_metadata()
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
             let ino = self.inodes.get_or_create(&path, is_dir);
             match self.make_attr(ino, &resolved) {
                 Some(attr) => reply.entry(&TTL, &attr, 0),
@@ -1668,6 +1677,135 @@ impl Filesystem for BranchFs {
                                 reply.entry(&TTL, &attr, 0);
                             } else {
                                 reply.error(libc::EIO);
+                            }
+                        }
+                        Err(_) => reply.error(libc::EIO),
+                    }
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
+                }
+            }
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        let resolved = match self.classify_ino(ino) {
+            Some(PathContext::BranchPath(branch, rel_path)) => {
+                if !self.manager.is_branch_valid(&branch) {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+                match self.resolve_for_branch(&branch, &rel_path) {
+                    Some(p) => p,
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                }
+            }
+            Some(PathContext::RootPath(ref rp)) => {
+                if self.is_stale() {
+                    reply.error(libc::ESTALE);
+                    return;
+                }
+                match self.resolve(rp) {
+                    Some(p) => p,
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        match std::fs::read_link(&resolved) {
+            Ok(target) => reply.data(target.as_os_str().as_encoded_bytes()),
+            Err(_) => reply.error(libc::EINVAL),
+        }
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let parent_path = match self.inodes.get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let name_str = link_name.to_string_lossy();
+
+        let branch_ctx = match classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
+
+        if let Some((branch, parent_rel)) = branch_ctx {
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            if storage::ensure_parent_dirs(&delta).is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+            match std::os::unix::fs::symlink(target, &delta) {
+                Ok(()) => {
+                    let inode_path = format!("/@{}{}", branch, rel_path);
+                    let ino = self.inodes.get_or_create(&inode_path, false);
+                    match self.make_attr(ino, &delta) {
+                        Some(attr) => reply.entry(&TTL, &attr, 0),
+                        None => reply.error(libc::EIO),
+                    }
+                }
+                Err(_) => reply.error(libc::EIO),
+            }
+        } else {
+            match classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+                    let delta = self.get_delta_path(&path);
+                    if storage::ensure_parent_dirs(&delta).is_err() {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                    match std::os::unix::fs::symlink(target, &delta) {
+                        Ok(()) => {
+                            if self.is_stale() {
+                                let _ = std::fs::remove_file(&delta);
+                                reply.error(libc::ESTALE);
+                                return;
+                            }
+                            let ino = self.inodes.get_or_create(&path, false);
+                            match self.make_attr(ino, &delta) {
+                                Some(attr) => reply.entry(&TTL, &attr, 0),
+                                None => reply.error(libc::EIO),
                             }
                         }
                         Err(_) => reply.error(libc::EIO),

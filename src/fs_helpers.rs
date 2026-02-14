@@ -50,11 +50,13 @@ impl BranchFs {
     ) -> std::io::Result<std::path::PathBuf> {
         let delta = self.get_delta_path_for_branch(branch, rel_path);
 
-        if !delta.exists() {
+        if delta.symlink_metadata().is_err() {
             if let Some(src) = self.resolve_for_branch(branch, rel_path) {
-                if src.exists() && src.is_file() {
-                    storage::copy_file(&src, &delta)
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if let Ok(meta) = src.symlink_metadata() {
+                    if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                        storage::copy_entry(&src, &delta)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
                 }
             }
         }
@@ -65,7 +67,7 @@ impl BranchFs {
     }
 
     pub(crate) fn make_attr(&self, ino: u64, path: &Path) -> Option<FileAttr> {
-        let meta = std::fs::metadata(path).ok()?;
+        let meta = std::fs::symlink_metadata(path).ok()?;
         let kind = if meta.is_dir() {
             FileType::Directory
         } else if meta.is_symlink() {
@@ -172,9 +174,13 @@ impl BranchFs {
                         format!("{}/{}", rel_path, name)
                     };
                     let inode_path = format!("{}{}", inode_prefix, child_rel);
-                    let is_dir = entry.path().is_dir();
+                    let ft = entry.file_type();
+                    let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
+                    let is_dir = !is_symlink && ft.as_ref().map(|t| t.is_dir()).unwrap_or(false);
                     let child_ino = self.inodes.get_or_create(&inode_path, is_dir);
-                    let kind = if is_dir {
+                    let kind = if is_symlink {
+                        FileType::Symlink
+                    } else if is_dir {
                         FileType::Directory
                     } else {
                         FileType::RegularFile
@@ -197,9 +203,14 @@ impl BranchFs {
                                 format!("{}/{}", rel_path, name)
                             };
                             let inode_path = format!("{}{}", inode_prefix, child_rel);
-                            let is_dir = entry.path().is_dir();
+                            let ft = entry.file_type();
+                            let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
+                            let is_dir =
+                                !is_symlink && ft.as_ref().map(|t| t.is_dir()).unwrap_or(false);
                             let child_ino = self.inodes.get_or_create(&inode_path, is_dir);
-                            let kind = if is_dir {
+                            let kind = if is_symlink {
+                                FileType::Symlink
+                            } else if is_dir {
                                 FileType::Directory
                             } else {
                                 FileType::RegularFile

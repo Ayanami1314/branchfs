@@ -17,6 +17,22 @@ pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Symlink-aware copy: if `src` is a symlink, recreate the symlink at `dst`;
+/// otherwise fall back to a regular file copy.
+pub fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
+    ensure_parent_dirs(dst)?;
+    let meta = src.symlink_metadata()?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(src)?;
+        // Remove any pre-existing entry at dst so symlink() won't fail
+        let _ = fs::remove_file(dst);
+        std::os::unix::fs::symlink(&target, dst)?;
+    } else {
+        fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
 pub fn read_file(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let mut buf = Vec::new();
