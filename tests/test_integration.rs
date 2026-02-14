@@ -4,6 +4,7 @@
 //! Run with: cargo test --test test_integration -- --ignored
 
 use std::fs;
+use std::os::unix::fs as unix_fs;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -412,4 +413,244 @@ fn test_mkdir_and_nested_files() {
 
     // None of this should be in base
     assert!(!fix.base.join("a").exists());
+}
+
+// ── Symlink tests ───────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn test_symlink_base_visible() {
+    let fix = TestFixture::new("sym_base");
+
+    // Add symlinks to base before mounting
+    unix_fs::symlink("file1.txt", fix.base.join("link1")).unwrap();
+    unix_fs::symlink("nonexistent", fix.base.join("dangling")).unwrap();
+
+    fix.mount();
+
+    // Symlinks should be visible as symlinks (not followed)
+    assert!(
+        fix.mnt
+            .join("link1")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "base symlink should be a symlink through the mount"
+    );
+    assert_eq!(
+        fs::read_link(fix.mnt.join("link1"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "file1.txt"
+    );
+
+    // Dangling symlink should be visible too
+    assert!(
+        fix.mnt
+            .join("dangling")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "dangling symlink should be visible"
+    );
+    assert_eq!(
+        fs::read_link(fix.mnt.join("dangling"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "nonexistent"
+    );
+
+    // Following the valid symlink should work
+    assert_eq!(
+        fs::read_to_string(fix.mnt.join("link1")).unwrap(),
+        "base content\n"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_symlink_create_in_branch() {
+    let fix = TestFixture::new("sym_create");
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Create a symlink in the branch
+    unix_fs::symlink("file1.txt", bdir.join("new_link")).unwrap();
+
+    assert!(
+        bdir.join("new_link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "created symlink should be a symlink"
+    );
+    assert_eq!(
+        fs::read_link(bdir.join("new_link"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "file1.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(bdir.join("new_link")).unwrap(),
+        "base content\n"
+    );
+
+    // Should NOT be in base
+    assert!(!fix.base.join("new_link").exists());
+}
+
+#[test]
+#[ignore]
+fn test_symlink_commit() {
+    let fix = TestFixture::new("sym_commit");
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Create symlinks in the branch
+    unix_fs::symlink("file1.txt", bdir.join("link_a")).unwrap();
+    unix_fs::symlink("no_target", bdir.join("link_dangling")).unwrap();
+
+    // Commit
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_commit(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "commit should succeed");
+
+    // Symlinks should now exist in base
+    assert!(
+        fix.base
+            .join("link_a")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "committed symlink should be a symlink in base"
+    );
+    assert_eq!(
+        fs::read_link(fix.base.join("link_a"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "file1.txt"
+    );
+
+    // Dangling symlink should also be committed
+    assert!(
+        fix.base
+            .join("link_dangling")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "committed dangling symlink should be a symlink in base"
+    );
+    assert_eq!(
+        fs::read_link(fix.base.join("link_dangling"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "no_target"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_symlink_abort() {
+    let fix = TestFixture::new("sym_abort");
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    unix_fs::symlink("file1.txt", bdir.join("aborted_link")).unwrap();
+    assert!(bdir.join("aborted_link").symlink_metadata().is_ok());
+
+    // Abort
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_abort(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "abort should succeed");
+
+    // Should not be in base
+    assert!(
+        fix.base.join("aborted_link").symlink_metadata().is_err(),
+        "aborted symlink should not be in base"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_symlink_delete_in_branch() {
+    let fix = TestFixture::new("sym_delete");
+
+    // Add a symlink to base
+    unix_fs::symlink("file1.txt", fix.base.join("link_del")).unwrap();
+
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Symlink should be visible
+    assert!(bdir
+        .join("link_del")
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    // Delete it in the branch
+    fs::remove_file(bdir.join("link_del")).unwrap();
+    assert!(
+        bdir.join("link_del").symlink_metadata().is_err(),
+        "symlink should be gone in branch"
+    );
+
+    // Base should still have it
+    assert!(
+        fix.base
+            .join("link_del")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "base symlink should be unaffected"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_symlink_isolation_between_branches() {
+    let fix = TestFixture::new("sym_isolation");
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    let branch_a = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE A");
+    let branch_b = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE B");
+
+    let dir_a = fix.branch_dir(&branch_a);
+    let dir_b = fix.branch_dir(&branch_b);
+
+    // Create different symlinks in each branch
+    unix_fs::symlink("file1.txt", dir_a.join("link_a")).unwrap();
+    unix_fs::symlink("file2.txt", dir_b.join("link_b")).unwrap();
+
+    // Each branch should only see its own symlink
+    assert!(dir_a.join("link_a").symlink_metadata().is_ok());
+    assert!(dir_a.join("link_b").symlink_metadata().is_err());
+
+    assert!(dir_b.join("link_b").symlink_metadata().is_ok());
+    assert!(dir_b.join("link_a").symlink_metadata().is_err());
 }

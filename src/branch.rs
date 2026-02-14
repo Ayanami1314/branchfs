@@ -11,6 +11,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
+use crate::storage;
 
 pub struct Branch {
     pub name: String,
@@ -104,7 +105,7 @@ impl Branch {
     }
 
     pub fn has_delta(&self, rel_path: &str) -> bool {
-        self.delta_path(rel_path).exists()
+        self.delta_path(rel_path).symlink_metadata().is_ok()
     }
 }
 
@@ -419,7 +420,7 @@ impl BranchManager {
         }
 
         let base = self.base_path.join(rel_path.trim_start_matches('/'));
-        if base.exists() {
+        if base.symlink_metadata().is_ok() {
             Ok(Some(base))
         } else {
             Ok(None)
@@ -476,8 +477,12 @@ impl BranchManager {
             // Apply tombstones as deletions
             for path in &child_tombstones {
                 let full_path = self.base_path.join(path.trim_start_matches('/'));
-                if full_path.exists() {
-                    if full_path.is_dir() {
+                if full_path.symlink_metadata().is_ok() {
+                    if full_path
+                        .symlink_metadata()
+                        .map(|m| m.file_type().is_dir())
+                        .unwrap_or(false)
+                    {
                         fs::remove_dir_all(&full_path)?;
                     } else {
                         fs::remove_file(&full_path)?;
@@ -493,10 +498,10 @@ impl BranchManager {
                 if let Some(parent_dir) = dest.parent() {
                     let _ = fs::create_dir_all(parent_dir);
                 }
-                if let Ok(meta) = src_path.metadata() {
+                if let Ok(meta) = src_path.symlink_metadata() {
                     total_bytes += meta.len();
                 }
-                let _ = fs::copy(src_path, &dest);
+                let _ = storage::copy_entry(src_path, &dest);
                 num_files += 1;
             })?;
 
@@ -557,7 +562,7 @@ impl BranchManager {
                 if let Some(parent_dir) = dest.parent() {
                     let _ = fs::create_dir_all(parent_dir);
                 }
-                let _ = fs::copy(src_path, &dest);
+                let _ = storage::copy_entry(src_path, &dest);
                 copied_paths.push(rel_path.to_string());
             })?;
 
@@ -661,7 +666,11 @@ impl BranchManager {
                 format!("{}/{}", prefix, name)
             };
 
-            if path.is_dir() {
+            let is_dir = path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if is_dir {
                 self.walk_files(&path, &rel_path, f)?;
             } else {
                 f(&rel_path, &path);
