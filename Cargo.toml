@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "FUSE filesystem with atomic branching for speculative execution"
-repository = "https://github.com/penberg/branchfs"
+repository = "https://github.com/multikernel/branchfs"
 keywords = ["fuse", "filesystem", "branching", "copy-on-write"]
 categories = ["filesystem"]
 
