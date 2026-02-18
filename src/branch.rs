@@ -13,6 +13,17 @@ use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
 use crate::storage;
 
+/// Remove a file or directory at `path`, following symlinks for the type check.
+/// Returns `Ok(())` even if the path doesn't exist; propagates real I/O errors.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match path.symlink_metadata() {
+        Ok(m) if m.file_type().is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
@@ -396,6 +407,42 @@ impl BranchManager {
         }
     }
 
+    /// Collect all candidate file/directory names visible in a directory
+    /// by walking the full branch ancestor chain and base directory.
+    /// Used by readdir to enumerate all possible entries before filtering.
+    pub fn collect_dir_names(&self, branch_name: &str, rel_path: &str) -> Result<HashSet<String>> {
+        let branches = self.branches.read();
+        let mut names = HashSet::new();
+
+        let mut current = branch_name;
+        loop {
+            let branch = branches
+                .get(current)
+                .ok_or_else(|| BranchError::NotFound(current.to_string()))?;
+
+            let delta_dir = branch.files_dir.join(rel_path.trim_start_matches('/'));
+            if let Ok(dir) = fs::read_dir(&delta_dir) {
+                for entry in dir.flatten() {
+                    names.insert(entry.file_name().to_string_lossy().to_string());
+                }
+            }
+
+            match &branch.parent {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+
+        let base_dir = self.base_path.join(rel_path.trim_start_matches('/'));
+        if let Ok(dir) = fs::read_dir(&base_dir) {
+            for entry in dir.flatten() {
+                names.insert(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+
+        Ok(names)
+    }
+
     pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
         let branches = self.branches.read();
 
@@ -477,22 +524,13 @@ impl BranchManager {
             // Apply tombstones as deletions
             for path in &child_tombstones {
                 let full_path = self.base_path.join(path.trim_start_matches('/'));
-                if full_path.symlink_metadata().is_ok() {
-                    if full_path
-                        .symlink_metadata()
-                        .map(|m| m.file_type().is_dir())
-                        .unwrap_or(false)
-                    {
-                        fs::remove_dir_all(&full_path)?;
-                    } else {
-                        fs::remove_file(&full_path)?;
-                    }
-                }
+                remove_entry(&full_path)?;
             }
 
             // Copy delta files to base
             let mut num_files = 0u64;
             let mut total_bytes = 0u64;
+            let mut committed_paths = Vec::new();
             self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
                 let dest = self.base_path.join(rel_path.trim_start_matches('/'));
                 if let Some(parent_dir) = dest.parent() {
@@ -503,7 +541,19 @@ impl BranchManager {
                 }
                 let _ = storage::copy_entry(src_path, &dest);
                 num_files += 1;
+                committed_paths.push(rel_path.to_string());
             })?;
+
+            // Remove main's delta for committed/tombstoned paths so base
+            // takes precedence.  Without this, main's pre-existing delta
+            // (written before branching) would overshadow the updated base.
+            if let Some(main_branch) = branches.get("main") {
+                let main_files_dir = &main_branch.files_dir;
+                for rel_path in committed_paths.iter().chain(&child_tombstones) {
+                    let main_delta = main_files_dir.join(rel_path.trim_start_matches('/'));
+                    let _ = remove_entry(&main_delta);
+                }
+            }
 
             // Increment parent's commit_count (first-wins bookkeeping)
             if let Some(main_branch) = branches.get("main") {
@@ -545,13 +595,7 @@ impl BranchManager {
             // and add tombstone to parent
             for tombstone in &child_tombstones {
                 let parent_delta = parent_files_dir.join(tombstone.trim_start_matches('/'));
-                if parent_delta.exists() {
-                    if parent_delta.is_dir() {
-                        let _ = fs::remove_dir_all(&parent_delta);
-                    } else {
-                        let _ = fs::remove_file(&parent_delta);
-                    }
-                }
+                let _ = remove_entry(&parent_delta);
                 parent_tombstones.insert(tombstone.clone());
             }
 
