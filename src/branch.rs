@@ -529,6 +529,7 @@ impl BranchManager {
             // Copy delta files to base
             let mut num_files = 0u64;
             let mut total_bytes = 0u64;
+            let mut committed_paths = Vec::new();
             self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
                 let dest = self.base_path.join(rel_path.trim_start_matches('/'));
                 if let Some(parent_dir) = dest.parent() {
@@ -539,7 +540,43 @@ impl BranchManager {
                 }
                 let _ = storage::copy_entry(src_path, &dest);
                 num_files += 1;
+                committed_paths.push(rel_path.to_string());
             })?;
+
+            // Remove main's delta for committed/tombstoned paths so base
+            // takes precedence.  Without this, main's pre-existing delta
+            // (written before branching) would overshadow the updated base.
+            if let Some(main_branch) = branches.get("main") {
+                let main_files_dir = &main_branch.files_dir;
+                for rel_path in &committed_paths {
+                    let main_delta = main_files_dir.join(rel_path.trim_start_matches('/'));
+                    if main_delta.symlink_metadata().is_ok() {
+                        if main_delta
+                            .symlink_metadata()
+                            .map(|m| m.file_type().is_dir())
+                            .unwrap_or(false)
+                        {
+                            let _ = fs::remove_dir_all(&main_delta);
+                        } else {
+                            let _ = fs::remove_file(&main_delta);
+                        }
+                    }
+                }
+                for path in &child_tombstones {
+                    let main_delta = main_files_dir.join(path.trim_start_matches('/'));
+                    if main_delta.symlink_metadata().is_ok() {
+                        if main_delta
+                            .symlink_metadata()
+                            .map(|m| m.file_type().is_dir())
+                            .unwrap_or(false)
+                        {
+                            let _ = fs::remove_dir_all(&main_delta);
+                        } else {
+                            let _ = fs::remove_file(&main_delta);
+                        }
+                    }
+                }
+            }
 
             // Increment parent's commit_count (first-wins bookkeeping)
             if let Some(main_branch) = branches.get("main") {
