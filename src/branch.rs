@@ -13,6 +13,17 @@ use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
 use crate::storage;
 
+/// Remove a file or directory at `path`, following symlinks for the type check.
+/// Returns `Ok(())` even if the path doesn't exist; propagates real I/O errors.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match path.symlink_metadata() {
+        Ok(m) if m.file_type().is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
@@ -513,17 +524,7 @@ impl BranchManager {
             // Apply tombstones as deletions
             for path in &child_tombstones {
                 let full_path = self.base_path.join(path.trim_start_matches('/'));
-                if full_path.symlink_metadata().is_ok() {
-                    if full_path
-                        .symlink_metadata()
-                        .map(|m| m.file_type().is_dir())
-                        .unwrap_or(false)
-                    {
-                        fs::remove_dir_all(&full_path)?;
-                    } else {
-                        fs::remove_file(&full_path)?;
-                    }
-                }
+                remove_entry(&full_path)?;
             }
 
             // Copy delta files to base
@@ -548,33 +549,9 @@ impl BranchManager {
             // (written before branching) would overshadow the updated base.
             if let Some(main_branch) = branches.get("main") {
                 let main_files_dir = &main_branch.files_dir;
-                for rel_path in &committed_paths {
+                for rel_path in committed_paths.iter().chain(&child_tombstones) {
                     let main_delta = main_files_dir.join(rel_path.trim_start_matches('/'));
-                    if main_delta.symlink_metadata().is_ok() {
-                        if main_delta
-                            .symlink_metadata()
-                            .map(|m| m.file_type().is_dir())
-                            .unwrap_or(false)
-                        {
-                            let _ = fs::remove_dir_all(&main_delta);
-                        } else {
-                            let _ = fs::remove_file(&main_delta);
-                        }
-                    }
-                }
-                for path in &child_tombstones {
-                    let main_delta = main_files_dir.join(path.trim_start_matches('/'));
-                    if main_delta.symlink_metadata().is_ok() {
-                        if main_delta
-                            .symlink_metadata()
-                            .map(|m| m.file_type().is_dir())
-                            .unwrap_or(false)
-                        {
-                            let _ = fs::remove_dir_all(&main_delta);
-                        } else {
-                            let _ = fs::remove_file(&main_delta);
-                        }
-                    }
+                    let _ = remove_entry(&main_delta);
                 }
             }
 
@@ -618,13 +595,7 @@ impl BranchManager {
             // and add tombstone to parent
             for tombstone in &child_tombstones {
                 let parent_delta = parent_files_dir.join(tombstone.trim_start_matches('/'));
-                if parent_delta.exists() {
-                    if parent_delta.is_dir() {
-                        let _ = fs::remove_dir_all(&parent_delta);
-                    } else {
-                        let _ = fs::remove_file(&parent_delta);
-                    }
-                }
+                let _ = remove_entry(&parent_delta);
                 parent_tombstones.insert(tombstone.clone());
             }
 
