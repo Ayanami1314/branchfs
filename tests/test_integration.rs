@@ -654,3 +654,251 @@ fn test_symlink_isolation_between_branches() {
     assert!(dir_b.join("link_b").symlink_metadata().is_ok());
     assert!(dir_b.join("link_a").symlink_metadata().is_err());
 }
+
+// ── Readdir inheritance tests ───────────────────────────────────────
+//
+// Regression tests for: readdir on branches not showing inherited files.
+// collect_readdir_entries() only read from base + one resolved directory,
+// missing files in parent branch deltas.
+
+/// Files written through the mount root (stored in main's delta) should
+/// appear in a child branch's directory listing, not just via direct access.
+#[test]
+#[ignore]
+fn test_readdir_branch_inherits_main_delta_files() {
+    let fix = TestFixture::new("readdir_inherit");
+    fix.mount();
+
+    // Write a file through the mount root — goes to main's delta
+    fs::write(fix.mnt.join("dynamic.txt"), "written via mount\n").unwrap();
+
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Direct access should work (resolve_path walks the chain)
+    assert!(
+        bdir.join("dynamic.txt").exists(),
+        "branch should see main's file via direct access"
+    );
+
+    // readdir should ALSO list it
+    let entries: Vec<String> = fs::read_dir(&bdir)
+        .expect("read_dir on branch")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        entries.contains(&"dynamic.txt".to_string()),
+        "readdir should list main's delta file; got: {:?}",
+        entries
+    );
+    // Should also list base files
+    assert!(
+        entries.contains(&"file1.txt".to_string()),
+        "readdir should list base files; got: {:?}",
+        entries
+    );
+    assert!(
+        entries.contains(&"file2.txt".to_string()),
+        "readdir should list base files; got: {:?}",
+        entries
+    );
+}
+
+/// readdir on a nested (grandchild) branch should list files from the
+/// parent branch's delta, the grandparent's delta, and base.
+#[test]
+#[ignore]
+fn test_readdir_nested_branch_inherits_parent_delta() {
+    let fix = TestFixture::new("readdir_nested");
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    // Create parent branch, write a file
+    let parent = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE parent");
+    let pdir = fix.branch_dir(&parent);
+    fs::write(pdir.join("parent_only.txt"), "from parent\n").unwrap();
+
+    // Create child branch from parent
+    let pctl = fix.open_branch_ctl(&parent);
+    let child = unsafe { ioctl_create(pctl.as_raw_fd()) }.expect("CREATE child");
+    let cdir = fix.branch_dir(&child);
+
+    // readdir on child should list parent's file + base files
+    let entries: Vec<String> = fs::read_dir(&cdir)
+        .expect("read_dir on child branch")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        entries.contains(&"parent_only.txt".to_string()),
+        "child readdir should list parent's file; got: {:?}",
+        entries
+    );
+    assert!(
+        entries.contains(&"file1.txt".to_string()),
+        "child readdir should list base files; got: {:?}",
+        entries
+    );
+}
+
+/// readdir should respect tombstones: a file deleted in a branch should
+/// not appear in that branch's directory listing.
+#[test]
+#[ignore]
+fn test_readdir_respects_tombstones() {
+    let fix = TestFixture::new("readdir_tomb");
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Delete a base file in the branch
+    fs::remove_file(bdir.join("file1.txt")).unwrap();
+
+    let entries: Vec<String> = fs::read_dir(&bdir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        !entries.contains(&"file1.txt".to_string()),
+        "deleted file should not appear in readdir; got: {:?}",
+        entries
+    );
+    // Other base files should still be there
+    assert!(
+        entries.contains(&"file2.txt".to_string()),
+        "undeleted file should still appear; got: {:?}",
+        entries
+    );
+}
+
+// ── Commit propagation tests ────────────────────────────────────────
+//
+// Regression tests for: committed changes not visible at mount root.
+// When committing to main, delta files were copied to base but main's
+// pre-existing delta was left untouched, overshadowing the updated base.
+
+/// After committing a branch that modified a file originally written
+/// through the mount root, reading from the mount root should return
+/// the committed version.
+#[test]
+#[ignore]
+fn test_commit_changes_visible_at_mount_root() {
+    let fix = TestFixture::new("commit_visible");
+    fix.mount();
+
+    // Write a file through the mount root — goes to main's delta
+    fs::write(fix.mnt.join("evolve.txt"), "version 1\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(fix.mnt.join("evolve.txt")).unwrap(),
+        "version 1\n"
+    );
+
+    // Create a branch and modify the file
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+    fs::write(bdir.join("evolve.txt"), "version 2\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(bdir.join("evolve.txt")).unwrap(),
+        "version 2\n"
+    );
+
+    // Mount root still sees version 1 (isolation)
+    assert_eq!(
+        fs::read_to_string(fix.mnt.join("evolve.txt")).unwrap(),
+        "version 1\n"
+    );
+
+    // Commit
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_commit(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "commit should succeed");
+
+    // Mount root should now see version 2
+    assert_eq!(
+        fs::read_to_string(fix.mnt.join("evolve.txt")).unwrap(),
+        "version 2\n",
+        "mount root should show committed content, not stale main delta"
+    );
+}
+
+/// After committing a branch that deletes a file originally written
+/// through the mount root, the file should be gone at the mount root.
+#[test]
+#[ignore]
+fn test_commit_deletion_visible_at_mount_root() {
+    let fix = TestFixture::new("commit_delete");
+    fix.mount();
+
+    // Write a file through the mount root
+    fs::write(fix.mnt.join("doomed.txt"), "will be deleted\n").unwrap();
+    assert!(fix.mnt.join("doomed.txt").exists());
+
+    // Create a branch and delete the file
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+    fs::remove_file(bdir.join("doomed.txt")).unwrap();
+    assert!(!bdir.join("doomed.txt").exists());
+
+    // Mount root still sees it (isolation)
+    assert!(fix.mnt.join("doomed.txt").exists());
+
+    // Commit
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_commit(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "commit should succeed");
+
+    // Mount root should no longer see the file
+    assert!(
+        !fix.mnt.join("doomed.txt").exists(),
+        "file deleted in branch should be gone at mount root after commit"
+    );
+}
+
+/// Modifying a base file (not main's delta) in a branch and committing
+/// should update the file visible at the mount root.
+#[test]
+#[ignore]
+fn test_commit_base_file_modification_visible_at_mount_root() {
+    let fix = TestFixture::new("commit_base_mod");
+    fix.mount();
+
+    // file1.txt is seeded in base (not via FUSE write, so no main delta)
+    assert_eq!(
+        fs::read_to_string(fix.mnt.join("file1.txt")).unwrap(),
+        "base content\n"
+    );
+
+    // Create a branch and modify the base file
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+    fs::write(bdir.join("file1.txt"), "updated in branch\n").unwrap();
+
+    // Commit
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_commit(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "commit should succeed");
+
+    // Mount root should see the update
+    assert_eq!(
+        fs::read_to_string(fix.mnt.join("file1.txt")).unwrap(),
+        "updated in branch\n",
+        "mount root should show committed content"
+    );
+
+    // Base should also be updated
+    assert_eq!(
+        fs::read_to_string(fix.base.join("file1.txt")).unwrap(),
+        "updated in branch\n",
+    );
+}
