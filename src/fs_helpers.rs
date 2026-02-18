@@ -142,6 +142,10 @@ impl BranchFs {
 
     /// Collect readdir entries for a directory resolved via a specific branch.
     ///
+    /// Walks the full ancestor chain (branch → parent → … → main → base) to
+    /// collect all candidate names, then resolves each via `resolve_path` to
+    /// respect tombstones and determine the correct file type.
+    ///
     /// `inode_prefix` controls how child inode paths are formed:
     /// - `"/@branch"` for branch subtrees (produces `/@branch/child`)
     /// - `""` for root-level paths (produces `/child`)
@@ -157,69 +161,45 @@ impl BranchFs {
             (ino, FileType::Directory, "..".to_string()),
         ];
 
-        let mut seen = std::collections::HashSet::new();
+        // Collect all candidate names from the full branch ancestor chain + base.
+        let mut candidates: Vec<String> = match self.manager.collect_dir_names(branch, rel_path) {
+            Ok(names) => names.into_iter().collect(),
+            Err(_) => return entries,
+        };
+        // Sort for deterministic readdir ordering across paged calls.
+        candidates.sort();
 
-        // Collect from base directory
-        let base_dir = self
-            .manager
-            .base_path
-            .join(rel_path.trim_start_matches('/'));
-        if let Ok(dir) = std::fs::read_dir(&base_dir) {
-            for entry in dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if seen.insert(name.clone()) {
-                    let child_rel = if rel_path == "/" {
-                        format!("/{}", name)
-                    } else {
-                        format!("{}/{}", rel_path, name)
-                    };
-                    let inode_path = format!("{}{}", inode_prefix, child_rel);
-                    let ft = entry.file_type();
-                    let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
-                    let is_dir = !is_symlink && ft.as_ref().map(|t| t.is_dir()).unwrap_or(false);
-                    let child_ino = self.inodes.get_or_create(&inode_path, is_dir);
-                    let kind = if is_symlink {
-                        FileType::Symlink
-                    } else if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    entries.push((child_ino, kind, name));
-                }
-            }
-        }
+        // For each candidate, resolve via the branch chain to check visibility
+        // (handles tombstones) and determine the actual file type.
+        for name in candidates {
+            let child_rel = if rel_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", rel_path, name)
+            };
 
-        // Collect from branch deltas
-        if let Some(resolved) = self.resolve_for_branch(branch, rel_path) {
-            if resolved != base_dir {
-                if let Ok(dir) = std::fs::read_dir(&resolved) {
-                    for entry in dir.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if seen.insert(name.clone()) {
-                            let child_rel = if rel_path == "/" {
-                                format!("/{}", name)
-                            } else {
-                                format!("{}/{}", rel_path, name)
-                            };
-                            let inode_path = format!("{}{}", inode_prefix, child_rel);
-                            let ft = entry.file_type();
-                            let is_symlink = ft.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
-                            let is_dir =
-                                !is_symlink && ft.as_ref().map(|t| t.is_dir()).unwrap_or(false);
-                            let child_ino = self.inodes.get_or_create(&inode_path, is_dir);
-                            let kind = if is_symlink {
-                                FileType::Symlink
-                            } else if is_dir {
-                                FileType::Directory
-                            } else {
-                                FileType::RegularFile
-                            };
-                            entries.push((child_ino, kind, name));
-                        }
-                    }
-                }
-            }
+            // resolve_path handles tombstone filtering — returns None for deleted files.
+            let resolved = match self.resolve_for_branch(branch, &child_rel) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let inode_path = format!("{}{}", inode_prefix, child_rel);
+            let ft = resolved.symlink_metadata();
+            let is_symlink = ft
+                .as_ref()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let is_dir = !is_symlink && ft.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let child_ino = self.inodes.get_or_create(&inode_path, is_dir);
+            let kind = if is_symlink {
+                FileType::Symlink
+            } else if is_dir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            entries.push((child_ino, kind, name));
         }
 
         entries

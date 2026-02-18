@@ -396,6 +396,42 @@ impl BranchManager {
         }
     }
 
+    /// Collect all candidate file/directory names visible in a directory
+    /// by walking the full branch ancestor chain and base directory.
+    /// Used by readdir to enumerate all possible entries before filtering.
+    pub fn collect_dir_names(&self, branch_name: &str, rel_path: &str) -> Result<HashSet<String>> {
+        let branches = self.branches.read();
+        let mut names = HashSet::new();
+
+        let mut current = branch_name;
+        loop {
+            let branch = branches
+                .get(current)
+                .ok_or_else(|| BranchError::NotFound(current.to_string()))?;
+
+            let delta_dir = branch.files_dir.join(rel_path.trim_start_matches('/'));
+            if let Ok(dir) = fs::read_dir(&delta_dir) {
+                for entry in dir.flatten() {
+                    names.insert(entry.file_name().to_string_lossy().to_string());
+                }
+            }
+
+            match &branch.parent {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+
+        let base_dir = self.base_path.join(rel_path.trim_start_matches('/'));
+        if let Ok(dir) = fs::read_dir(&base_dir) {
+            for entry in dir.flatten() {
+                names.insert(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+
+        Ok(names)
+    }
+
     pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
         let branches = self.branches.read();
 
