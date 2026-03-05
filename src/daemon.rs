@@ -400,9 +400,21 @@ pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io
             ))
         }
         Ok(ForkResult::Child) => {
-            // Child: become daemon
-            // Create new session to detach from terminal
+            // Child: become a proper daemon
             let _ = setsid();
+
+            // Redirect stdin/stdout/stderr to /dev/null so the parent's
+            // pipes are closed immediately (otherwise subprocess callers
+            // that capture output will block waiting for pipe EOF).
+            if let Ok(devnull) = std::fs::File::open("/dev/null") {
+                use std::os::unix::io::AsRawFd;
+                let fd = devnull.as_raw_fd();
+                unsafe {
+                    libc::dup2(fd, 0);
+                    libc::dup2(fd, 1);
+                    libc::dup2(fd, 2);
+                }
+            }
 
             // Run the daemon (this blocks until shutdown)
             let daemon = match Daemon::new(base_path.clone(), storage_path, base_path) {
