@@ -3,7 +3,7 @@
 
 source "$(dirname "$0")/test_helper.sh"
 
-test_create_branch_without_mount() {
+test_create_branch() {
     setup
     do_mount
 
@@ -82,7 +82,7 @@ test_create_sibling_branches() {
 }
 
 # Run tests
-run_test "Create Branch Without Mount" test_create_branch_without_mount
+run_test "Create Branch" test_create_branch
 run_test "Create Branch and Auto-Switch" test_create_branch_with_switch
 run_test "Create Nested Branches" test_create_nested_branches
 run_test "Create Sibling Branches" test_create_sibling_branches

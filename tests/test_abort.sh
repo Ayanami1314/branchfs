@@ -104,11 +104,15 @@ test_abort_main_fails() {
     setup
     do_mount
 
-    # Try to abort main (should fail or do nothing)
-    # We're on main after mount, trying to abort should fail
-    if "$BRANCHFS" abort "$TEST_MNT" 2>&1; then
-        # If it doesn't fail, that's okay - it might just be a no-op
-        echo "  (abort main was a no-op)"
+    # Try to abort main — should fail
+    if "$BRANCHFS" abort "$TEST_MNT" --storage "$TEST_STORAGE" 2>/dev/null; then
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}✗${NC} Abort main should fail"
+    else
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}✓${NC} Abort main correctly failed"
     fi
 
     # Should still be mounted
