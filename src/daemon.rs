@@ -388,10 +388,15 @@ pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io
     // proper fd inheritance control — stdin/stdout/stderr are /dev/null
     // so callers that capture output won't block.
     let exe = std::env::current_exe()?;
-    let env_val = format!("{}:{}", base_path.display(), storage_path.display());
 
     Command::new(exe)
-        .env("_BRANCHFS_DAEMON", env_val)
+        .args([
+            "run-daemon",
+            "--base",
+            &base_path.to_string_lossy(),
+            "--storage",
+            &storage_path.to_string_lossy(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
