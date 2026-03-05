@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fuser::{BackgroundSession, MountOption};
-use nix::unistd::{fork, setsid, ForkResult};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::process::{Command, Stdio};
 
 use crate::branch::BranchManager;
 use crate::error::Result;
@@ -381,58 +381,34 @@ pub fn is_daemon_running(socket_path: &Path) -> bool {
 
 pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io::Result<()> {
     let socket_path = storage_path.join("daemon.sock");
-    let base_path = base_path.to_path_buf();
-    let storage_path = storage_path.to_path_buf();
 
-    // Fork to create daemon process
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { .. }) => {
-            // Parent: wait for daemon to be ready
-            for _ in 0..50 {
-                std::thread::sleep(Duration::from_millis(100));
-                if is_daemon_running(&socket_path) {
-                    return Ok(());
-                }
-            }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Daemon failed to start",
-            ))
+    // Spawn the daemon as a detached child process.  The env var tells
+    // main() to skip CLI parsing and run the daemon loop directly.
+    // Using Command (instead of fork) avoids unsafe code and gives us
+    // proper fd inheritance control — stdin/stdout/stderr are /dev/null
+    // so callers that capture output won't block.
+    let exe = std::env::current_exe()?;
+    let env_val = format!("{}:{}", base_path.display(), storage_path.display());
+
+    Command::new(exe)
+        .env("_BRANCHFS_DAEMON", env_val)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    // Wait for daemon to be ready
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if is_daemon_running(&socket_path) {
+            return Ok(());
         }
-        Ok(ForkResult::Child) => {
-            // Child: become a proper daemon
-            let _ = setsid();
-
-            // Redirect stdin/stdout/stderr to /dev/null so the parent's
-            // pipes are closed immediately (otherwise subprocess callers
-            // that capture output will block waiting for pipe EOF).
-            if let Ok(devnull) = std::fs::File::open("/dev/null") {
-                use std::os::unix::io::AsRawFd;
-                let fd = devnull.as_raw_fd();
-                unsafe {
-                    libc::dup2(fd, 0);
-                    libc::dup2(fd, 1);
-                    libc::dup2(fd, 2);
-                }
-            }
-
-            // Run the daemon (this blocks until shutdown)
-            let daemon = match Daemon::new(base_path.clone(), storage_path, base_path) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("Failed to create daemon: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            if let Err(e) = daemon.run() {
-                log::error!("Daemon error: {}", e);
-                std::process::exit(1);
-            }
-            std::process::exit(0);
-        }
-        Err(e) => Err(std::io::Error::other(format!("Fork failed: {}", e))),
     }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "Daemon failed to start",
+    ))
 }
 
 pub fn ensure_daemon(base_path: Option<&Path>, storage_path: &Path) -> std::io::Result<()> {

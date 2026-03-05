@@ -118,6 +118,23 @@ fn get_mount_branch(storage: &Path, mountpoint: &Path) -> Result<String> {
 
 fn main() -> Result<()> {
     env_logger::init();
+
+    // Re-exec entry point: when spawned as a daemon by start_daemon_background(),
+    // we skip CLI parsing and run the daemon loop directly.
+    if let Ok(val) = std::env::var("_BRANCHFS_DAEMON") {
+        let parts: Vec<&str> = val.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            let base = PathBuf::from(parts[0]);
+            let storage = PathBuf::from(parts[1]);
+            let daemon = daemon::Daemon::new(base.clone(), storage, base)
+                .map_err(|e| anyhow::anyhow!("Failed to create daemon: {}", e))?;
+            daemon
+                .run()
+                .map_err(|e| anyhow::anyhow!("Daemon error: {}", e))?;
+        }
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
