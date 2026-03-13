@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BackingId, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyIoctl, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyIoctl, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use parking_lot::RwLock;
 
@@ -714,12 +714,25 @@ impl Filesystem for BranchFs {
         // to the same inode (after COW is already done).
         if let Some(file) = self.write_cache.get(ino, epoch) {
             use std::io::{Seek, SeekFrom, Write};
+            // Check quota for writes that extend the file
+            let old_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let write_end = offset as u64 + data.len() as u64;
+            if write_end > old_size && self.manager.quota.check(write_end - old_size).is_err() {
+                reply.error(libc::ENOSPC);
+                return;
+            }
             if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                 reply.error(libc::EIO);
                 return;
             }
             match file.write(data) {
-                Ok(n) => reply.written(n as u32),
+                Ok(n) => {
+                    let new_end = offset as u64 + n as u64;
+                    if new_end > old_size {
+                        self.manager.quota.add(new_end - old_size);
+                    }
+                    reply.written(n as u32)
+                }
                 Err(_) => reply.error(libc::EIO),
             }
             return;
@@ -780,6 +793,12 @@ impl Filesystem for BranchFs {
         // Serve from the just-cached write fd
         if let Some(file) = self.write_cache.get(ino, epoch) {
             use std::io::{Seek, SeekFrom, Write};
+            let old_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let write_end = offset as u64 + data.len() as u64;
+            if write_end > old_size && self.manager.quota.check(write_end - old_size).is_err() {
+                reply.error(libc::ENOSPC);
+                return;
+            }
             if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                 reply.error(libc::EIO);
                 return;
@@ -789,6 +808,10 @@ impl Filesystem for BranchFs {
                     if is_root && self.is_stale() {
                         reply.error(libc::ESTALE);
                         return;
+                    }
+                    let new_end = offset as u64 + n as u64;
+                    if new_end > old_size {
+                        self.manager.quota.add(new_end - old_size);
                     }
                     reply.written(n as u32)
                 }
@@ -1076,7 +1099,9 @@ impl Filesystem for BranchFs {
                 b.add_tombstone(&rel_path)?;
                 let delta = b.delta_path(&rel_path);
                 if delta.exists() {
+                    let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
                     std::fs::remove_file(&delta)?;
+                    self.manager.quota.sub(freed);
                 }
                 Ok(())
             });
@@ -1106,7 +1131,9 @@ impl Filesystem for BranchFs {
                         b.add_tombstone(&path)?;
                         let delta = b.delta_path(&path);
                         if delta.exists() {
+                            let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
                             std::fs::remove_file(&delta)?;
+                            self.manager.quota.sub(freed);
                         }
                         Ok(())
                     });
@@ -1450,11 +1477,30 @@ impl Filesystem for BranchFs {
                     return;
                 }
                 if let Some(new_size) = size {
-                    if let Ok(delta) = self.ensure_cow_for_branch(&branch, &rel_path) {
-                        let file = std::fs::OpenOptions::new().write(true).open(&delta);
-                        if let Ok(f) = file {
-                            let _ = f.set_len(new_size);
+                    match self.ensure_cow_for_branch(&branch, &rel_path) {
+                        Ok(delta) => {
+                            let file = std::fs::OpenOptions::new().write(true).open(&delta);
+                            if let Ok(f) = file {
+                                let old_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                                if new_size > old_size
+                                    && self.manager.quota.check(new_size - old_size).is_err()
+                                {
+                                    reply.error(libc::ENOSPC);
+                                    return;
+                                }
+                                let _ = f.set_len(new_size);
+                                if new_size > old_size {
+                                    self.manager.quota.add(new_size - old_size);
+                                } else if old_size > new_size {
+                                    self.manager.quota.sub(old_size - new_size);
+                                }
+                            }
                         }
+                        Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
+                            reply.error(libc::ENOSPC);
+                            return;
+                        }
+                        Err(_) => {}
                     }
                 }
                 if mode.is_some()
@@ -1478,11 +1524,30 @@ impl Filesystem for BranchFs {
             _ => {
                 // Root path (existing logic)
                 if let Some(new_size) = size {
-                    if let Ok(delta) = self.ensure_cow(&path) {
-                        let file = std::fs::OpenOptions::new().write(true).open(&delta);
-                        if let Ok(f) = file {
-                            let _ = f.set_len(new_size);
+                    match self.ensure_cow(&path) {
+                        Ok(delta) => {
+                            let file = std::fs::OpenOptions::new().write(true).open(&delta);
+                            if let Ok(f) = file {
+                                let old_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                                if new_size > old_size
+                                    && self.manager.quota.check(new_size - old_size).is_err()
+                                {
+                                    reply.error(libc::ENOSPC);
+                                    return;
+                                }
+                                let _ = f.set_len(new_size);
+                                if new_size > old_size {
+                                    self.manager.quota.add(new_size - old_size);
+                                } else if old_size > new_size {
+                                    self.manager.quota.sub(old_size - new_size);
+                                }
+                            }
                         }
+                        Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
+                            reply.error(libc::ENOSPC);
+                            return;
+                        }
+                        Err(_) => {}
                     }
                 }
                 if mode.is_some()
@@ -1813,6 +1878,49 @@ impl Filesystem for BranchFs {
                 }
                 _ => {
                     reply.error(libc::ENOENT);
+                }
+            }
+        }
+    }
+
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        let block_size = 4096u32;
+        let quota = &self.manager.quota;
+
+        if let Some(max_bytes) = quota.max() {
+            let used = quota.used();
+            let total_blocks = max_bytes / block_size as u64;
+            let used_blocks = used.min(max_bytes) / block_size as u64;
+            let avail_blocks = total_blocks.saturating_sub(used_blocks);
+
+            reply.statfs(
+                total_blocks, // total blocks
+                avail_blocks, // free blocks
+                avail_blocks, // available blocks (to unprivileged users)
+                0,            // total inodes (0 = unspecified)
+                0,            // free inodes
+                block_size,   // block size
+                255,          // max name length
+                block_size,   // fragment size
+            );
+        } else {
+            // No quota — report from the storage filesystem
+            let storage_path = &self.manager.storage_path;
+            match nix::sys::statvfs::statvfs(storage_path) {
+                Ok(stat) => {
+                    reply.statfs(
+                        stat.blocks(),
+                        stat.blocks_free(),
+                        stat.blocks_available(),
+                        stat.files(),
+                        stat.files_free(),
+                        stat.block_size() as u32,
+                        stat.name_max() as u32,
+                        stat.fragment_size() as u32,
+                    );
+                }
+                Err(_) => {
+                    reply.error(libc::EIO);
                 }
             }
         }

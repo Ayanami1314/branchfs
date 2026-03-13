@@ -31,6 +31,10 @@ enum Commands {
         #[arg(long)]
         passthrough: bool,
 
+        /// Maximum storage size for all branch deltas (e.g. "500M", "2G", bytes)
+        #[arg(long, value_parser = parse_size)]
+        max_storage: Option<u64>,
+
         /// Mount point
         mountpoint: PathBuf,
     },
@@ -97,7 +101,30 @@ enum Commands {
 
         #[arg(long)]
         storage: PathBuf,
+
+        #[arg(long)]
+        max_storage: Option<u64>,
     },
+}
+
+/// Parse a human-readable size string like "500M", "2G", "1024", "1T".
+fn parse_size(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size string".to_string());
+    }
+    let (num_str, multiplier) = match s.as_bytes().last() {
+        Some(b'K' | b'k') => (&s[..s.len() - 1], 1024u64),
+        Some(b'M' | b'm') => (&s[..s.len() - 1], 1024 * 1024),
+        Some(b'G' | b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some(b'T' | b't') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    let num: u64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid size: {}", s))?;
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("size overflow: {}", s))
 }
 
 fn get_socket_path(storage: &Path) -> PathBuf {
@@ -135,6 +162,7 @@ fn main() -> Result<()> {
             base,
             storage,
             passthrough,
+            max_storage,
             mountpoint,
         } => {
             if passthrough && nix::unistd::geteuid().as_raw() != 0 {
@@ -149,7 +177,7 @@ fn main() -> Result<()> {
             let base = base.map(|b| b.canonicalize()).transpose()?;
 
             // Ensure daemon is running (auto-start if needed)
-            daemon::ensure_daemon(base.as_deref(), &storage)
+            daemon::ensure_daemon(base.as_deref(), &storage, max_storage)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             // Create mountpoint
@@ -321,12 +349,16 @@ fn main() -> Result<()> {
                 process::exit(1);
             }
         }
-        Commands::RunDaemon { base, storage } => {
+        Commands::RunDaemon {
+            base,
+            storage,
+            max_storage,
+        } => {
             std::fs::create_dir_all(&storage)?;
             let storage = storage.canonicalize()?;
             let base = base.canonicalize()?;
 
-            let d = daemon::Daemon::new(base.clone(), storage, base)
+            let d = daemon::Daemon::new(base.clone(), storage, base, max_storage)
                 .map_err(|e| anyhow::anyhow!("Failed to create daemon: {}", e))?;
             d.run()
                 .map_err(|e| anyhow::anyhow!("Daemon error: {}", e))?;
