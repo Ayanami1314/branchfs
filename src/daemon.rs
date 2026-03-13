@@ -92,6 +92,7 @@ impl Daemon {
         base_path: PathBuf,
         storage_path: PathBuf,
         _workspace_path: PathBuf,
+        max_storage: Option<u64>,
     ) -> Result<Self> {
         let socket_path = storage_path.join("daemon.sock");
 
@@ -121,6 +122,7 @@ impl Daemon {
             storage_path.clone(),
             base_path.clone(),
             base_path.clone(),
+            max_storage,
         )?);
 
         Ok(Self {
@@ -379,7 +381,11 @@ pub fn is_daemon_running(socket_path: &Path) -> bool {
     UnixStream::connect(socket_path).is_ok()
 }
 
-pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io::Result<()> {
+pub fn start_daemon_background(
+    base_path: &Path,
+    storage_path: &Path,
+    max_storage: Option<u64>,
+) -> std::io::Result<()> {
     let socket_path = storage_path.join("daemon.sock");
 
     // Spawn the daemon as a detached child process.  The env var tells
@@ -389,15 +395,18 @@ pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io
     // so callers that capture output won't block.
     let exe = std::env::current_exe()?;
 
-    Command::new(exe)
-        .args([
-            "run-daemon",
-            "--base",
-            &base_path.to_string_lossy(),
-            "--storage",
-            &storage_path.to_string_lossy(),
-        ])
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "run-daemon",
+        "--base",
+        &base_path.to_string_lossy(),
+        "--storage",
+        &storage_path.to_string_lossy(),
+    ]);
+    if let Some(max) = max_storage {
+        cmd.args(["--max-storage", &max.to_string()]);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
@@ -416,7 +425,11 @@ pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io
     ))
 }
 
-pub fn ensure_daemon(base_path: Option<&Path>, storage_path: &Path) -> std::io::Result<()> {
+pub fn ensure_daemon(
+    base_path: Option<&Path>,
+    storage_path: &Path,
+    max_storage: Option<u64>,
+) -> std::io::Result<()> {
     let socket_path = storage_path.join("daemon.sock");
 
     if is_daemon_running(&socket_path) {
@@ -440,5 +453,5 @@ pub fn ensure_daemon(base_path: Option<&Path>, storage_path: &Path) -> std::io::
         }
     };
 
-    start_daemon_background(&base_path, storage_path)
+    start_daemon_background(&base_path, storage_path, max_storage)
 }

@@ -54,8 +54,14 @@ impl BranchFs {
             if let Some(src) = self.resolve_for_branch(branch, rel_path) {
                 if let Ok(meta) = src.symlink_metadata() {
                     if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                        let src_size = meta.len();
+                        self.manager
+                            .quota
+                            .check(src_size)
+                            .map_err(std::io::Error::from_raw_os_error)?;
                         storage::copy_entry(&src, &delta)
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        self.manager.quota.add(src_size);
                     }
                 }
             }

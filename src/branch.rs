@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,6 +12,79 @@ use parking_lot::{Mutex, RwLock};
 use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
 use crate::storage;
+
+/// Tracks storage usage across all branches and enforces an optional quota.
+/// Only counts delta files (the actual disk cost of branching).
+pub struct StorageQuota {
+    /// Current total bytes used in the storage directory (all branches' deltas).
+    used_bytes: AtomicI64,
+    /// Maximum allowed bytes. None = unlimited.
+    max_bytes: Option<u64>,
+}
+
+impl StorageQuota {
+    pub fn new(max_bytes: Option<u64>) -> Self {
+        Self {
+            used_bytes: AtomicI64::new(0),
+            max_bytes,
+        }
+    }
+
+    /// Walk the storage directory to compute initial usage.
+    pub fn scan_usage(storage_path: &Path, max_bytes: Option<u64>) -> Self {
+        let quota = Self::new(max_bytes);
+        let branches_dir = storage_path.join("branches");
+        if branches_dir.exists() {
+            let bytes = Self::dir_size(&branches_dir);
+            quota.used_bytes.store(bytes as i64, Ordering::Relaxed);
+        }
+        quota
+    }
+
+    fn dir_size(path: &Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    total += Self::dir_size(&p);
+                } else if let Ok(meta) = p.symlink_metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+        total
+    }
+
+    /// Check if `additional` bytes can be allocated. Returns Err(ENOSPC) if not.
+    pub fn check(&self, additional: u64) -> std::result::Result<(), i32> {
+        if let Some(max) = self.max_bytes {
+            let current = self.used_bytes.load(Ordering::Relaxed);
+            if current as u64 + additional > max {
+                return Err(libc::ENOSPC);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record that `bytes` were added to storage.
+    pub fn add(&self, bytes: u64) {
+        self.used_bytes.fetch_add(bytes as i64, Ordering::Relaxed);
+    }
+
+    /// Record that `bytes` were removed from storage.
+    pub fn sub(&self, bytes: u64) {
+        self.used_bytes.fetch_sub(bytes as i64, Ordering::Relaxed);
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used_bytes.load(Ordering::Relaxed).max(0) as u64
+    }
+
+    pub fn max(&self) -> Option<u64> {
+        self.max_bytes
+    }
+}
 
 /// Remove a file or directory at `path`, following symlinks for the type check.
 /// Returns `Ok(())` even if the path doesn't exist; propagates real I/O errors.
@@ -162,11 +235,20 @@ pub struct BranchManager {
     opened_inodes: Mutex<HashMap<String, HashSet<u64>>>,
     /// Current branch per mount — single source of truth
     mount_branches: RwLock<HashMap<PathBuf, String>>,
+    /// Storage quota enforcement
+    pub quota: StorageQuota,
 }
 
 impl BranchManager {
-    pub fn new(storage_path: PathBuf, base_path: PathBuf, workspace_path: PathBuf) -> Result<Self> {
+    pub fn new(
+        storage_path: PathBuf,
+        base_path: PathBuf,
+        workspace_path: PathBuf,
+        max_storage: Option<u64>,
+    ) -> Result<Self> {
         fs::create_dir_all(&storage_path)?;
+
+        let quota = StorageQuota::scan_usage(&storage_path, max_storage);
 
         // Always start fresh with just the "main" branch
         let mut branches = HashMap::new();
@@ -182,6 +264,7 @@ impl BranchManager {
             notifiers: Mutex::new(HashMap::new()),
             opened_inodes: Mutex::new(HashMap::new()),
             mount_branches: RwLock::new(HashMap::new()),
+            quota,
         })
     }
 
