@@ -25,7 +25,7 @@ unsafe fn ioctl_create(fd: i32) -> Result<String, i32> {
         }
         Ok(name)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         let mut buf = [0u8; 128];
         let ret = libc::ioctl(
@@ -54,7 +54,7 @@ unsafe fn ioctl_commit(fd: i32) -> i32 {
         }
         0
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         libc::ioctl(
             fd,
@@ -76,7 +76,7 @@ unsafe fn ioctl_abort(fd: i32) -> i32 {
         }
         0
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_ABORT as libc::c_ulong)
     }
@@ -100,7 +100,7 @@ impl TestFixture {
         // Clean up leftovers from a previous failed run
         #[cfg(target_os = "linux")]
         let unmount_cmd = "fusermount3";
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         let unmount_cmd = "umount";
 
         let _ = Command::new(unmount_cmd)

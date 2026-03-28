@@ -1124,10 +1124,10 @@ impl Filesystem for BranchFs {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(e) = crate::platform::check_rename_flags(_flags) {
+        if let Err(e) = crate::platform::check_rename_flags(flags) {
             reply.error(e);
             return;
         }
@@ -1214,7 +1214,7 @@ impl Filesystem for BranchFs {
         }
 
         // RENAME_NOREPLACE
-        if crate::platform::check_rename_noreplace(_flags)
+        if crate::platform::check_rename_noreplace(flags)
             && self.resolve_for_branch(&branch, &dst_rel).is_some()
         {
             reply.error(libc::EEXIST);
@@ -1290,7 +1290,7 @@ impl Filesystem for BranchFs {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         // Control file is always openable (no epoch check)
         if ino == CTL_INO {
             reply.opened(0, 0);
@@ -1323,7 +1323,7 @@ impl Filesystem for BranchFs {
                     reply.error(libc::ENOENT);
                     return;
                 }
-                let _resolved = match self.resolve_for_branch(&branch, &rel_path) {
+                let resolved = match self.resolve_for_branch(&branch, &rel_path) {
                     Some(p) => p,
                     None => {
                         reply.error(libc::ENOENT);
@@ -1333,7 +1333,7 @@ impl Filesystem for BranchFs {
                 self.manager.register_opened_inode(&branch, ino);
 
                 if self.passthrough_enabled {
-                    self.try_open_passthrough(_flags, &branch, &rel_path, &_resolved, reply);
+                    self.try_open_passthrough(flags, &branch, &rel_path, &resolved, reply);
                 } else {
                     reply.opened(0, 0);
                 }
@@ -1344,7 +1344,7 @@ impl Filesystem for BranchFs {
                     reply.error(libc::ESTALE);
                     return;
                 }
-                let _resolved = match self.resolve(&path) {
+                let resolved = match self.resolve(&path) {
                     Some(p) => p,
                     None => {
                         reply.error(libc::ENOENT);
@@ -1355,7 +1355,7 @@ impl Filesystem for BranchFs {
                 self.manager.register_opened_inode(&branch_name, ino);
 
                 if self.passthrough_enabled {
-                    self.try_open_passthrough(_flags, &branch_name, &path, &_resolved, reply);
+                    self.try_open_passthrough(flags, &branch_name, &path, &resolved, reply);
                 } else {
                     reply.opened(0, 0);
                 }
