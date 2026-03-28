@@ -4,7 +4,7 @@ use std::time::UNIX_EPOCH;
 
 use fuser::{FileAttr, FileType};
 
-use crate::fs::{BranchFs, BLOCK_SIZE, CTL_INO};
+use crate::fs::{BranchFs, BLOCK_SIZE};
 use crate::storage;
 
 impl BranchFs {
@@ -124,9 +124,7 @@ impl BranchFs {
 
     /// Return a synthetic ctl-file FileAttr.
     pub(crate) fn ctl_file_attr(&self, ino: u64) -> FileAttr {
-        // Report a non-zero size so the kernel issues read() calls.
-        // The actual content length is determined by the read handler.
-        let size = if ino == CTL_INO { 256 } else { 0 };
+        let size = crate::platform::ctl_file_size(ino);
         FileAttr {
             ino,
             size,

@@ -147,10 +147,10 @@ impl Daemon {
         self.manager.set_mount_branch(mountpoint, branch_name);
 
         let fs = BranchFs::new(self.manager.clone(), mountpoint.to_path_buf(), passthrough);
-        let options = vec![
+        let mut options = vec![
             MountOption::FSName("branchfs".to_string()),
-            MountOption::DefaultPermissions,
         ];
+        options.extend(crate::platform::get_mount_options());
 
         log::info!(
             "Spawning mount for branch '{}' at {:?}",

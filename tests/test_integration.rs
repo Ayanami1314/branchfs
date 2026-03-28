@@ -11,27 +11,70 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use branchfs::{FS_IOC_BRANCH_ABORT, FS_IOC_BRANCH_COMMIT, FS_IOC_BRANCH_CREATE};
+
 
 /// Helper: CREATE a branch. Returns the new branch name.
 unsafe fn ioctl_create(fd: i32) -> Result<String, i32> {
-    let mut buf = [0u8; 128];
-    let ret = libc::ioctl(fd, FS_IOC_BRANCH_CREATE as libc::c_ulong, buf.as_mut_ptr());
-    if ret < 0 {
-        return Err(*libc::__errno_location());
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::io::FromRawFd;
+        let name = format!("test-branch-{}", uuid::Uuid::new_v4());
+        let mut file = std::fs::File::from_raw_fd(libc::dup(fd));
+        let _ = file.seek(SeekFrom::Start(0));
+        if let Err(_) = file.write_all(format!("create:{}", name).as_bytes()) {
+            return Err(libc::EIO);
+        }
+        Ok(name)
     }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Ok(String::from_utf8_lossy(&buf[..end]).to_string())
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut buf = [0u8; 128];
+        let ret = libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_CREATE as libc::c_ulong, buf.as_mut_ptr());
+        if ret < 0 {
+            return Err(unsafe { *libc::__errno_location() });
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(String::from_utf8_lossy(&buf[..end]).to_string())
+    }
 }
 
 /// Helper: COMMIT the branch identified by the ctl fd's inode.
 unsafe fn ioctl_commit(fd: i32) -> i32 {
-    libc::ioctl(fd, FS_IOC_BRANCH_COMMIT as libc::c_ulong)
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::io::FromRawFd;
+        let mut file = std::fs::File::from_raw_fd(libc::dup(fd));
+        let _ = file.seek(SeekFrom::Start(0));
+        if let Err(_) = file.write_all(b"commit") {
+            return -1;
+        }
+        0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_COMMIT as libc::c_ulong)
+    }
 }
 
 /// Helper: ABORT the branch identified by the ctl fd's inode.
 unsafe fn ioctl_abort(fd: i32) -> i32 {
-    libc::ioctl(fd, FS_IOC_BRANCH_ABORT as libc::c_ulong)
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::io::FromRawFd;
+        let mut file = std::fs::File::from_raw_fd(libc::dup(fd));
+        let _ = file.seek(SeekFrom::Start(0));
+        if let Err(_) = file.write_all(b"abort") {
+            return -1;
+        }
+        0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_ABORT as libc::c_ulong)
+    }
 }
 
 struct TestFixture {
@@ -50,7 +93,12 @@ impl TestFixture {
         let mnt = PathBuf::from(format!("{}_mnt", prefix));
 
         // Clean up leftovers from a previous failed run
-        let _ = Command::new("fusermount3")
+        #[cfg(target_os = "linux")]
+        let unmount_cmd = "fusermount3";
+        #[cfg(not(target_os = "linux"))]
+        let unmount_cmd = "umount";
+
+        let _ = Command::new(unmount_cmd)
             .args(["-u", mnt.to_str().unwrap()])
             .stderr(Stdio::null())
             .status();
