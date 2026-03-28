@@ -1,8 +1,8 @@
+use fuser::BackingId;
 use fuser::{KernelConfig, MountOption, ReplyEmpty, ReplyOpen};
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
-use fuser::BackingId;
 
 pub const FS_IOC_BRANCH_CREATE: u32 = 0x8080_6200; // _IOR('b', 0, [u8; 128])
 pub const FS_IOC_BRANCH_COMMIT: u32 = 0x0000_6201; // _IO ('b', 1)
@@ -49,7 +49,11 @@ pub fn check_rename_noreplace(flags: u32) -> bool {
 
 pub fn ctl_file_size(ino: u64) -> u64 {
     // On Linux we report 256 for CTL_INO to ensure the kernel issues read() calls.
-    if ino == crate::inode::CTL_INO { 256 } else { 0 }
+    if ino == crate::inode::CTL_INO {
+        256
+    } else {
+        0
+    }
 }
 
 pub struct PassthroughState {
@@ -66,11 +70,7 @@ impl PassthroughState {
     }
 }
 
-pub fn try_open_passthrough(
-    state: &mut PassthroughState,
-    file: File,
-    reply: ReplyOpen,
-) {
+pub fn try_open_passthrough(state: &mut PassthroughState, file: File, reply: ReplyOpen) {
     let backing_id = match reply.open_backing(&file) {
         Ok(id) => id,
         Err(_) => {

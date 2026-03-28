@@ -84,10 +84,22 @@ impl BranchFs {
             }
         } else if cmd_lower == "commit" {
             let branch = self.get_branch_name();
-            self.finalize_branch_op(&branch, self.manager.commit(&branch), "commit", data.len() as u32, reply);
+            self.finalize_branch_op(
+                &branch,
+                self.manager.commit(&branch),
+                "commit",
+                data.len() as u32,
+                reply,
+            );
         } else if cmd_lower == "abort" {
             let branch = self.get_branch_name();
-            self.finalize_branch_op(&branch, self.manager.abort(&branch), "abort", data.len() as u32, reply);
+            self.finalize_branch_op(
+                &branch,
+                self.manager.abort(&branch),
+                "abort",
+                data.len() as u32,
+                reply,
+            );
         } else {
             log::warn!(
                 "Unknown root ctl command: '{}' (supported: create, commit, abort, switch:name)",
@@ -106,9 +118,21 @@ impl BranchFs {
         log::info!("Branch ctl command: '{}' for branch '{}'", cmd, branch);
 
         if cmd_lower == "commit" {
-            self.finalize_branch_op(branch, self.manager.commit(branch), "commit", data.len() as u32, reply);
+            self.finalize_branch_op(
+                branch,
+                self.manager.commit(branch),
+                "commit",
+                data.len() as u32,
+                reply,
+            );
         } else if cmd_lower == "abort" {
-            self.finalize_branch_op(branch, self.manager.abort(branch), "abort", data.len() as u32, reply);
+            self.finalize_branch_op(
+                branch,
+                self.manager.abort(branch),
+                "abort",
+                data.len() as u32,
+                reply,
+            );
         } else if cmd_lower == "create" || cmd_lower.starts_with("create:") {
             let name = if cmd_lower.starts_with("create:") {
                 cmd[7..].trim().to_string()
@@ -137,7 +161,14 @@ impl BranchFs {
         }
     }
 
-    fn finalize_branch_op(&mut self, branch: &str, result: Result<String, BranchError>, op: &str, written_len: u32, reply: ReplyWrite) {
+    fn finalize_branch_op(
+        &mut self,
+        branch: &str,
+        result: Result<String, BranchError>,
+        op: &str,
+        written_len: u32,
+        reply: ReplyWrite,
+    ) {
         match result {
             Ok(parent) => {
                 // Clear inodes for the affected branch prefix and update epoch

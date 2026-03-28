@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyIoctl, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use parking_lot::RwLock;
 
@@ -17,8 +17,8 @@ use crate::branch::BranchManager;
 use crate::error::BranchError;
 use crate::fs_path::{classify_path, PathContext};
 use crate::inode::{InodeManager, ROOT_INO};
-use crate::storage;
 use crate::platform::{FS_IOC_BRANCH_ABORT, FS_IOC_BRANCH_COMMIT, FS_IOC_BRANCH_CREATE};
+use crate::storage;
 
 // Zero TTL forces the kernel to always revalidate with FUSE, ensuring consistent
 // behavior after branch switches. This is important for speculative execution
@@ -250,7 +250,7 @@ impl BranchFs {
         } else {
             File::open(&backing_path)
         };
-        
+
         match open_result {
             Ok(f) => crate::platform::try_open_passthrough(&mut self.passthrough_state, f, reply),
             Err(_) => reply.opened(0, 0),

@@ -11,8 +11,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-
-
 /// Helper: CREATE a branch. Returns the new branch name.
 unsafe fn ioctl_create(fd: i32) -> Result<String, i32> {
     #[cfg(target_os = "macos")]
@@ -30,7 +28,11 @@ unsafe fn ioctl_create(fd: i32) -> Result<String, i32> {
     #[cfg(not(target_os = "macos"))]
     {
         let mut buf = [0u8; 128];
-        let ret = libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_CREATE as libc::c_ulong, buf.as_mut_ptr());
+        let ret = libc::ioctl(
+            fd,
+            branchfs::platform::FS_IOC_BRANCH_CREATE as libc::c_ulong,
+            buf.as_mut_ptr(),
+        );
         if ret < 0 {
             return Err(unsafe { *libc::__errno_location() });
         }
@@ -54,7 +56,10 @@ unsafe fn ioctl_commit(fd: i32) -> i32 {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_COMMIT as libc::c_ulong)
+        libc::ioctl(
+            fd,
+            branchfs::platform::FS_IOC_BRANCH_COMMIT as libc::c_ulong,
+        )
     }
 }
 

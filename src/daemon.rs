@@ -147,9 +147,7 @@ impl Daemon {
         self.manager.set_mount_branch(mountpoint, branch_name);
 
         let fs = BranchFs::new(self.manager.clone(), mountpoint.to_path_buf(), passthrough);
-        let mut options = vec![
-            MountOption::FSName("branchfs".to_string()),
-        ];
+        let mut options = vec![MountOption::FSName("branchfs".to_string())];
         options.extend(crate::platform::get_mount_options());
 
         log::info!(

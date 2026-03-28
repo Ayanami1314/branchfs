@@ -52,11 +52,7 @@ impl PassthroughState {
     }
 }
 
-pub fn try_open_passthrough(
-    _state: &mut PassthroughState,
-    _file: File,
-    reply: ReplyOpen,
-) {
+pub fn try_open_passthrough(_state: &mut PassthroughState, _file: File, reply: ReplyOpen) {
     // Fallback if we accidentally call this on non-Linux
     reply.opened(0, 0);
 }
