@@ -46,9 +46,15 @@ pub fn ctl_file_size(_ino: u64) -> u64 {
 
 pub struct PassthroughState {}
 
+impl Default for PassthroughState {
+    fn default() -> Self {
+        Self {}
+    }
+}
+
 impl PassthroughState {
     pub fn new() -> Self {
-        Self {}
+        Self::default()
     }
 }
 

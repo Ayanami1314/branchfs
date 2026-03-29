@@ -1873,11 +1873,11 @@ impl Filesystem for BranchFs {
             match nix::sys::statvfs::statvfs(storage_path) {
                 Ok(stat) => {
                     reply.statfs(
-                        stat.blocks().into(),
-                        stat.blocks_free().into(),
-                        stat.blocks_available().into(),
-                        stat.files().into(),
-                        stat.files_free().into(),
+                        stat.blocks(),
+                        stat.blocks_free(),
+                        stat.blocks_available(),
+                        stat.files(),
+                        stat.files_free(),
                         stat.block_size() as u32,
                         stat.name_max() as u32,
                         stat.fragment_size() as u32,

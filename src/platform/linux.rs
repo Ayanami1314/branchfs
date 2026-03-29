@@ -61,12 +61,18 @@ pub struct PassthroughState {
     pub backing_ids: HashMap<u64, BackingId>,
 }
 
-impl PassthroughState {
-    pub fn new() -> Self {
+impl Default for PassthroughState {
+    fn default() -> Self {
         Self {
             next_fh: AtomicU64::new(1),
             backing_ids: HashMap::new(),
         }
+    }
+}
+
+impl PassthroughState {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
