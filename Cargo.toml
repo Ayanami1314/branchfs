@@ -23,7 +23,7 @@ thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = { version = "0.16", features = ["abi-7-40", "libfuse"] }
+fuser = { version = "0.16", features = ["abi-7-31", "libfuse"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fuser = { version = "0.16", features = ["abi-7-31", "libfuse"] }

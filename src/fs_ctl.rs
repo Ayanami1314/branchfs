@@ -173,6 +173,11 @@ impl BranchFs {
             Ok(parent) => {
                 // Clear inodes for the affected branch prefix and update epoch
                 self.inodes.clear_prefix(&format!("/@{}", branch));
+                // Also clear root-path inodes since branch content changed
+                self.inodes.clear();
+                // Drop cached file descriptors so next read re-resolves
+                self.open_cache = crate::fs::OpenFileCache::new();
+                self.write_cache = crate::fs::WriteFileCache::new();
                 self.current_epoch
                     .store(self.manager.get_epoch(), Ordering::SeqCst);
                 // Only switch the mount if the operated branch is the current mount branch
@@ -193,6 +198,8 @@ impl BranchFs {
                         current
                     );
                 }
+                // Invalidate kernel page cache for all mounts
+                self.manager.invalidate_all_mounts();
                 reply.written(written_len)
             }
             Err(BranchError::Conflict(_)) => {

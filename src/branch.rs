@@ -422,7 +422,7 @@ impl BranchManager {
     }
 
     /// Invalidate kernel cache for all mounts
-    fn invalidate_all_mounts(&self) {
+    pub fn invalidate_all_mounts(&self) {
         let notifiers = self.notifiers.lock();
         let opened_inodes = self.opened_inodes.lock();
 

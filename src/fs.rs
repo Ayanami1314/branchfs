@@ -33,14 +33,14 @@ pub(crate) const CTL_INO: u64 = u64::MAX - 1;
 /// Eliminates per-read resolve_path() (2-3 stat syscalls on non-existent
 /// delta paths) and File::open()/close() overhead.  Invalidated on write
 /// (COW changes the backing path) and on epoch change (branch switch).
-struct OpenFileCache {
+pub(crate) struct OpenFileCache {
     ino: u64,
     epoch: u64,
     file: Option<File>,
 }
 
 impl OpenFileCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ino: 0,
             epoch: 0,
@@ -74,14 +74,14 @@ impl OpenFileCache {
 
 /// Cached open file descriptor for writes (delta files).
 /// Same idea as OpenFileCache but opened in write mode.
-struct WriteFileCache {
+pub(crate) struct WriteFileCache {
     ino: u64,
     epoch: u64,
     file: Option<File>,
 }
 
 impl WriteFileCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ino: 0,
             epoch: 0,
@@ -123,10 +123,10 @@ pub struct BranchFs {
     pub(crate) gid: AtomicU32,
     /// Cached open file — avoids re-resolve + re-open on consecutive reads
     /// to the same inode.
-    open_cache: OpenFileCache,
+    pub(crate) open_cache: OpenFileCache,
     /// Cached write fd — avoids re-open on consecutive writes to the same
     /// delta file (after COW).
-    write_cache: WriteFileCache,
+    pub(crate) write_cache: WriteFileCache,
     /// Whether FUSE passthrough mode is enabled (--passthrough flag).
     passthrough_enabled: bool,
     /// FUSE passthrough state (fh counter, backing_ids)
@@ -1873,11 +1873,11 @@ impl Filesystem for BranchFs {
             match nix::sys::statvfs::statvfs(storage_path) {
                 Ok(stat) => {
                     reply.statfs(
-                        stat.blocks(),
-                        stat.blocks_free(),
-                        stat.blocks_available(),
-                        stat.files(),
-                        stat.files_free(),
+                        stat.blocks().into(),
+                        stat.blocks_free().into(),
+                        stat.blocks_available().into(),
+                        stat.files().into(),
+                        stat.files_free().into(),
                         stat.block_size() as u32,
                         stat.name_max() as u32,
                         stat.fragment_size() as u32,

@@ -1,6 +1,4 @@
-use fuser::BackingId;
 use fuser::{KernelConfig, MountOption, ReplyEmpty, ReplyOpen};
-use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,23 +10,12 @@ pub fn get_mount_options() -> Vec<MountOption> {
     vec![MountOption::DefaultPermissions]
 }
 
-pub fn setup_capabilities(config: &mut KernelConfig, passthrough_enabled: &mut bool) {
+pub fn setup_capabilities(_config: &mut KernelConfig, passthrough_enabled: &mut bool) {
+    // Passthrough requires FUSE ABI >= 7.40 + kernel support.
+    // When compiled with abi-7-31, always disable.
     if *passthrough_enabled {
-        if let Err(e) = config.add_capabilities(fuser::consts::FUSE_PASSTHROUGH) {
-            log::warn!(
-                "Kernel does not support FUSE_PASSTHROUGH (unsupported bits: {:#x}), disabling",
-                e
-            );
-            *passthrough_enabled = false;
-        } else if let Err(e) = config.set_max_stack_depth(2) {
-            log::warn!(
-                "Failed to set max_stack_depth (max: {}), disabling passthrough",
-                e
-            );
-            *passthrough_enabled = false;
-        } else {
-            log::info!("FUSE passthrough enabled");
-        }
+        log::warn!("FUSE passthrough not available (ABI < 7.40), disabling");
+        *passthrough_enabled = false;
     }
 }
 
@@ -48,7 +35,6 @@ pub fn check_rename_noreplace(flags: u32) -> bool {
 }
 
 pub fn ctl_file_size(ino: u64) -> u64 {
-    // On Linux we report 256 for CTL_INO to ensure the kernel issues read() calls.
     if ino == crate::fs::CTL_INO {
         256
     } else {
@@ -58,14 +44,12 @@ pub fn ctl_file_size(ino: u64) -> u64 {
 
 pub struct PassthroughState {
     pub next_fh: AtomicU64,
-    pub backing_ids: HashMap<u64, BackingId>,
 }
 
 impl Default for PassthroughState {
     fn default() -> Self {
         Self {
             next_fh: AtomicU64::new(1),
-            backing_ids: HashMap::new(),
         }
     }
 }
@@ -76,20 +60,11 @@ impl PassthroughState {
     }
 }
 
-pub fn try_open_passthrough(state: &mut PassthroughState, file: File, reply: ReplyOpen) {
-    let backing_id = match reply.open_backing(&file) {
-        Ok(id) => id,
-        Err(_) => {
-            reply.opened(0, 0);
-            return;
-        }
-    };
-
-    let fh = state.next_fh.fetch_add(1, Ordering::Relaxed);
-    reply.opened_passthrough(fh, 0, &backing_id);
-    state.backing_ids.insert(fh, backing_id);
+pub fn try_open_passthrough(_state: &mut PassthroughState, _file: File, reply: ReplyOpen) {
+    // No passthrough support with abi-7-31, fall back to normal open
+    reply.opened(0, 0);
 }
 
-pub fn release_passthrough(state: &mut PassthroughState, fh: u64) {
-    state.backing_ids.remove(&fh);
+pub fn release_passthrough(_state: &mut PassthroughState, _fh: u64) {
+    // no-op without passthrough
 }
